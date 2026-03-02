@@ -1,0 +1,12 @@
+# Core dependencies
+pyTelegramBotAPI==4.29.1
+requests>=2.31.0
+python-dotenv==1.0.0
+fastapi==0.110.0
+uvicorn==0.29.0
+psutil==5.9.8
+
+# Optional: Country data and phone number utilities
+# Uncomment if you want to use advanced country features
+# pycountry==22.3.5
+# phonenumbers==8.13.17
