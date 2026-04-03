@@ -513,11 +513,11 @@ def process_incoming_message(
     if service_name_override:
         override_text, override_custom_id = get_service_emoji_override_data(service_name_override)
         service_name_text = service_name_override
-        service_emoji = override_text or service_emoji
-        service_custom_emoji_id = override_custom_id or service_custom_emoji_id
+        service_emoji = override_text
+        service_custom_emoji_id = override_custom_id
         service_name = format_service_display(service_name_override, webhook_override=True, html=True)
-        group_service_icon = override_text or group_service_icon
-        group_service_custom_emoji_id = override_custom_id or group_service_custom_emoji_id
+        group_service_icon = override_text
+        group_service_custom_emoji_id = override_custom_id
     if country_override:
         country_icon_html = format_display_country(country_override, html=True)
     if not service_name:
