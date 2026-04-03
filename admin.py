@@ -5,7 +5,22 @@ import shutil
 import re
 import threading
 import queue
-from core import BACKUP_DIR, DB_NAME
+import requests
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from entity_text import EntityTextBuilder
+from core import (
+    BACKUP_DIR,
+    DB_ENGINE,
+    DB_NAME,
+    format_service_display,
+    format_service_visible,
+    get_service_button_icon_data,
+    get_service_button_emoji,
+    save_service_button_emoji,
+)
+from custom_emoji import normalize_custom_emoji_text
 
 # Try to import psutil for system monitoring (optional)
 try:
@@ -18,6 +33,95 @@ def register_handlers(bot, get_db_connection, logger):
     broadcast_queue = queue.Queue()
     broadcast_worker_started = False
     forwarder_panel_users = set()
+    broadcast_send_workers = max(1, int(os.getenv("BROADCAST_SEND_WORKERS", "4")))
+    broadcast_send_delay = max(0.0, float(os.getenv("BROADCAST_SEND_DELAY", "0.0")))
+
+    def _normalize_entities(entities):
+        normalized = []
+        for entity in list(entities or []):
+            if entity is None:
+                continue
+            if isinstance(entity, dict):
+                normalized.append(entity)
+                continue
+            if hasattr(entity, "to_dict"):
+                normalized.append(entity.to_dict())
+                continue
+            entity_type = getattr(entity, "type", None)
+            offset = getattr(entity, "offset", None)
+            length = getattr(entity, "length", None)
+            if entity_type is None or offset is None or length is None:
+                continue
+            item = {
+                "type": entity_type,
+                "offset": int(offset),
+                "length": int(length),
+            }
+            custom_emoji_id = getattr(entity, "custom_emoji_id", None)
+            if custom_emoji_id:
+                item["custom_emoji_id"] = custom_emoji_id
+            url = getattr(entity, "url", None)
+            if url:
+                item["url"] = url
+            user = getattr(entity, "user", None)
+            if user and hasattr(user, "id"):
+                item["user"] = {"id": user.id, "is_bot": getattr(user, "is_bot", False), "first_name": getattr(user, "first_name", "")}
+            language = getattr(entity, "language", None)
+            if language:
+                item["language"] = language
+            normalized.append(item)
+        return normalized
+
+    def _send_message_raw(chat_id, text, parse_mode=None, entities=None):
+        payload = {"chat_id": chat_id, "text": text or ""}
+        normalized_entities = _normalize_entities(entities)
+        if normalized_entities:
+            payload["entities"] = normalized_entities
+        elif parse_mode:
+            payload["parse_mode"] = parse_mode
+        resp = requests.post(f"https://api.telegram.org/bot{bot.token}/sendMessage", json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("ok"):
+            raise RuntimeError(data.get("description") or "sendMessage failed")
+
+    def _send_photo_raw(chat_id, photo_file_id, caption="", parse_mode=None, caption_entities=None):
+        payload = {"chat_id": chat_id, "photo": photo_file_id, "caption": caption or ""}
+        normalized_entities = _normalize_entities(caption_entities)
+        if normalized_entities:
+            payload["caption_entities"] = normalized_entities
+        elif parse_mode:
+            payload["parse_mode"] = parse_mode
+        resp = requests.post(f"https://api.telegram.org/bot{bot.token}/sendPhoto", json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("ok"):
+            raise RuntimeError(data.get("description") or "sendPhoto failed")
+
+    def _broadcast_send_one(user_id, media_type, text, parse_mode, photo_file_id, entities, caption_entities):
+        if not user_id:
+            return "skip", ""
+        try:
+            if media_type == "photo" and photo_file_id:
+                if caption_entities:
+                    _send_photo_raw(user_id, photo_file_id, caption=text or "", parse_mode=parse_mode, caption_entities=caption_entities)
+                else:
+                    bot.send_photo(user_id, photo_file_id, caption=text or "", parse_mode=parse_mode, caption_entities=caption_entities)
+            else:
+                if entities:
+                    _send_message_raw(user_id, text, parse_mode=parse_mode, entities=entities)
+                else:
+                    bot.send_message(user_id, text, parse_mode=parse_mode, entities=entities)
+            if broadcast_send_delay:
+                time.sleep(broadcast_send_delay)
+            return "sent", ""
+        except Exception as e:
+            error_msg = str(e)
+            if "bot was blocked" in error_msg or "user is deactivated" in error_msg:
+                return "blocked", error_msg
+            if "chat not found" in error_msg:
+                return "not_found", error_msg
+            return "failed", error_msg
 
     def answer_cbq(call, *args, **kwargs):
         """Defensive wrapper: callback queries can expire; never crash polling on answer failures."""
@@ -43,6 +147,8 @@ def register_handlers(bot, get_db_connection, logger):
                 title = job.get("title", "Broadcast")
                 media_type = job.get("media_type", "text")
                 photo_file_id = job.get("photo_file_id")
+                entities = job.get("entities")
+                caption_entities = job.get("caption_entities")
 
                 try:
                     with get_db_connection() as conn:
@@ -58,21 +164,34 @@ def register_handlers(bot, get_db_connection, logger):
                 blocked_count = 0
                 not_found_count = 0
 
-                for (user_id,) in users:
-                    try:
-                        if user_id:
-                            if media_type == "photo" and photo_file_id:
-                                bot.send_photo(user_id, photo_file_id, caption=text or "", parse_mode=parse_mode)
-                            else:
-                                bot.send_message(user_id, text, parse_mode=parse_mode)
-                            sent_count += 1
-                    except Exception as e:
-                        error_msg = str(e)
-                        if "bot was blocked" in error_msg or "user is deactivated" in error_msg:
-                            blocked_count += 1
-                        elif "chat not found" in error_msg:
-                            not_found_count += 1
-                        failed_count += 1
+                if users:
+                    max_workers = min(broadcast_send_workers, max(1, len(users)))
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = {
+                            executor.submit(
+                                _broadcast_send_one,
+                                user_id,
+                                media_type,
+                                text,
+                                parse_mode,
+                                photo_file_id,
+                                entities,
+                                caption_entities,
+                            ): user_id
+                            for (user_id,) in users
+                        }
+                        for future in as_completed(futures):
+                            status, _error_msg = future.result()
+                            if status == "sent":
+                                sent_count += 1
+                            elif status == "blocked":
+                                blocked_count += 1
+                                failed_count += 1
+                            elif status == "not_found":
+                                not_found_count += 1
+                                failed_count += 1
+                            elif status == "failed":
+                                failed_count += 1
 
                 result_text = f" <b>{title} Complete!</b>\n\n"
                 result_text += f" Sent: {sent_count}\n"
@@ -94,7 +213,7 @@ def register_handlers(bot, get_db_connection, logger):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def enqueue_broadcast(admin_id, text, parse_mode=None, title="Broadcast", media_type="text", photo_file_id=None):
+    def enqueue_broadcast(admin_id, text, parse_mode=None, title="Broadcast", media_type="text", photo_file_id=None, entities=None, caption_entities=None):
         start_broadcast_worker()
         broadcast_queue.put({
             "admin_id": admin_id,
@@ -103,18 +222,212 @@ def register_handlers(bot, get_db_connection, logger):
             "title": title,
             "media_type": media_type,
             "photo_file_id": photo_file_id,
+            "entities": entities,
+            "caption_entities": caption_entities,
         })
 
     def get_country_flag(country_name, sample_numbers=None):
-        from flag import get_flag, detect_country_from_numbers
-        if sample_numbers:
-            try:
-                detected = detect_country_from_numbers(sample_numbers, country_hint=country_name)
-                if detected and detected.get("flag"):
-                    return detected["flag"]
-            except Exception:
-                pass
+        from flag import get_flag
         return get_flag(country_name)
+
+    def format_country_display(country_name, html=False, custom_emoji_id="", flag_text=""):
+        from flag import format_display_country
+        return format_display_country(country_name, html=html, custom_emoji_id=custom_emoji_id, flag_text=flag_text)
+
+    def format_country_visible_label(country_name, flag_text="", custom_emoji_id=""):
+        from flag import format_display_country_visible
+        return format_display_country_visible(country_name, flag_text=flag_text, custom_emoji_id=custom_emoji_id)
+
+    def combine_country_display(flag_text, country_label, custom_emoji_id=""):
+        from flag import build_country_display
+        return build_country_display(flag_text, country_label, custom_emoji_id=custom_emoji_id)
+
+    def normalize_country_code_value(country_code):
+        from flag import normalize_country_code
+        return normalize_country_code(country_code)
+
+    def make_country_meta(flag_text="", country_code="", display_name="", custom_emoji_id=""):
+        flag_text = str(flag_text or "").strip()
+        custom_emoji_id = str(custom_emoji_id or "").strip()
+        country_code = normalize_country_code_value(country_code)
+        display_name = str(display_name or "").strip()
+        display_country = combine_country_display(flag_text, display_name, custom_emoji_id=custom_emoji_id)
+        return {
+            "flag": flag_text,
+            "custom_emoji_id": custom_emoji_id,
+            "code": country_code,
+            "display_name": display_name,
+            "display_country": display_country,
+        }
+
+    def format_service_label(service_name, service_emoji=None, service_custom_emoji_id=None, html=False):
+        return str(normalize_custom_emoji_text(service_name) or "").strip() or "Unknown"
+
+    def format_service_visible_label(service_name, service_emoji=None):
+        service_name = str(normalize_custom_emoji_text(service_name) or "").strip() or "Unknown"
+        button_emoji = str(service_emoji or "").strip() or get_service_button_emoji(service_name)
+        return f"{button_emoji} {service_name}".strip() if button_emoji else service_name
+
+    def build_service_country_summary_entities(
+        title,
+        country_label="",
+        country_flag="",
+        country_custom_emoji_id="",
+        service_name="",
+        service_emoji="",
+        service_custom_emoji_id="",
+        total_added=None,
+    ):
+        builder = EntityTextBuilder()
+        builder.append_bold(title)
+        builder.append("\n\n")
+        country_label = str(country_label or "").strip()
+        country_flag = str(country_flag or "").strip()
+        country_custom_emoji_id = str(country_custom_emoji_id or "").strip()
+        service_name = str(service_name or "").strip()
+        service_emoji = str(service_emoji or "").strip()
+        service_custom_emoji_id = str(service_custom_emoji_id or "").strip()
+        if service_name and (not service_emoji and not service_custom_emoji_id):
+            service_emoji, service_custom_emoji_id = get_service_button_icon_data(service_name)
+        line_started = False
+        if country_custom_emoji_id and country_flag:
+            builder.append_custom_emoji(country_flag, country_custom_emoji_id)
+            line_started = True
+        elif country_flag:
+            builder.append(country_flag)
+            line_started = True
+        if country_label:
+            if line_started:
+                builder.append(" ")
+            builder.append_bold(country_label)
+            line_started = True
+        if service_custom_emoji_id and service_emoji:
+            if line_started:
+                builder.append(" ")
+            builder.append_custom_emoji(service_emoji, service_custom_emoji_id)
+            line_started = True
+        elif service_emoji:
+            if line_started:
+                builder.append(" ")
+            builder.append(service_emoji)
+            line_started = True
+        if service_name:
+            if line_started:
+                builder.append(" ")
+            builder.append_bold(service_name)
+        builder.append("\n")
+        if total_added is not None:
+            builder.append("\n")
+            builder.append("➕ Total Added: ")
+            builder.append_bold(str(total_added))
+        builder.append("\n\nUse /start to get your numbers!")
+        return builder.text, builder.entities
+
+    def normalize_service_key(service_name):
+        return " ".join(str(service_name or "").strip().casefold().split())
+
+    def find_matching_service_names(service_name, conn):
+        target_key = normalize_service_key(service_name)
+        if not target_key:
+            return []
+        rows = conn.execute("SELECT DISTINCT name FROM services").fetchall()
+        matches = []
+        for (name,) in rows:
+            if normalize_service_key(name) == target_key:
+                matches.append(name)
+        return matches
+
+    def extract_custom_emoji_id_from_message(message):
+        for entity in list(getattr(message, "entities", None) or []):
+            if getattr(entity, "type", "") == "custom_emoji":
+                return str(getattr(entity, "custom_emoji_id", "") or "").strip()
+        for entity in list(getattr(message, "caption_entities", None) or []):
+            if getattr(entity, "type", "") == "custom_emoji":
+                return str(getattr(entity, "custom_emoji_id", "") or "").strip()
+        return ""
+
+    def parse_service_emoji_input(message):
+        raw_text = str((getattr(message, "text", None) or "")).strip()
+        detected_custom_id = extract_custom_emoji_id_from_message(message)
+        if detected_custom_id:
+            return raw_text, detected_custom_id
+        if re.fullmatch(r"\d{10,40}", raw_text or ""):
+            return "", raw_text
+        return raw_text, ""
+
+    def is_raw_custom_emoji_id_input(message):
+        raw_text = str((getattr(message, "text", None) or "")).strip()
+        if extract_custom_emoji_id_from_message(message):
+            return False
+        return bool(re.fullmatch(r"\d{10,40}", raw_text or ""))
+
+    def get_service_emoji_override(service_name, conn=None):
+        service_name = str(service_name or "").strip()
+        if not service_name:
+            return ""
+        target_key = normalize_service_key(service_name)
+        query = "SELECT service_name, service_emoji, COALESCE(custom_emoji_id, '') FROM service_emoji_overrides"
+        if conn is not None:
+            rows = conn.execute(query).fetchall()
+            for stored_name, stored_emoji, _custom_emoji_id in rows:
+                if normalize_service_key(stored_name) == target_key:
+                    return (stored_emoji or "").strip()
+            matches = find_matching_service_names(service_name, conn)
+            if matches:
+                row = conn.execute(
+                    "SELECT MAX(COALESCE(service_emoji, '')) FROM services WHERE name = ?",
+                    (matches[0],),
+                ).fetchone()
+                return (row[0] if row and row[0] else "").strip()
+            return ""
+        with get_db_connection() as temp_conn:
+            rows = temp_conn.execute(query).fetchall()
+            for stored_name, stored_emoji, _custom_emoji_id in rows:
+                if normalize_service_key(stored_name) == target_key:
+                    return (stored_emoji or "").strip()
+            matches = find_matching_service_names(service_name, temp_conn)
+            if matches:
+                row = temp_conn.execute(
+                    "SELECT MAX(COALESCE(service_emoji, '')) FROM services WHERE name = ?",
+                    (matches[0],),
+                ).fetchone()
+                return (row[0] if row and row[0] else "").strip()
+            return ""
+
+    def save_service_emoji_override(service_name, emoji_text, custom_emoji_id=""):
+        service_name = str(service_name or "").strip()
+        emoji_text = str(emoji_text or "").strip()
+        custom_emoji_id = str(custom_emoji_id or "").strip()
+        with get_db_connection() as conn:
+            matched_names = find_matching_service_names(service_name, conn)
+            canonical_name = matched_names[0] if matched_names else service_name
+            existing_rows = conn.execute(
+                "SELECT service_name FROM service_emoji_overrides"
+            ).fetchall()
+            delete_names = [
+                stored_name for (stored_name,) in existing_rows
+                if normalize_service_key(stored_name) == normalize_service_key(service_name)
+                and stored_name != canonical_name
+            ]
+            for stale_name in delete_names:
+                conn.execute("DELETE FROM service_emoji_overrides WHERE service_name = ?", (stale_name,))
+            conn.execute(
+                "INSERT INTO service_emoji_overrides (service_name, service_emoji, custom_emoji_id, updated_at) "
+                "VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(service_name) DO UPDATE SET service_emoji=excluded.service_emoji, "
+                "custom_emoji_id=excluded.custom_emoji_id, updated_at=CURRENT_TIMESTAMP",
+                (canonical_name, emoji_text, custom_emoji_id),
+            )
+            conn.commit()
+
+    def remove_service_emoji_override(service_name):
+        service_name = str(service_name or "").strip()
+        with get_db_connection() as conn:
+            rows = conn.execute("SELECT service_name FROM service_emoji_overrides").fetchall()
+            for (stored_name,) in rows:
+                if normalize_service_key(stored_name) == normalize_service_key(service_name):
+                    conn.execute("DELETE FROM service_emoji_overrides WHERE service_name = ?", (stored_name,))
+            conn.commit()
 
     def send_or_edit(chat_id, text, reply_markup=None, parse_mode=None, edit_msg_id=None):
         """Prefer editing existing admin inline message; fallback to send new message."""
@@ -143,7 +456,91 @@ def register_handlers(bot, get_db_connection, logger):
 
     def is_cancel_text(text):
         val = (text or "").strip().lower()
-        return val in {"cancel", "/cancel", "back", "0"}
+        cleaned = re.sub(r'[^a-z0-9/ ]', '', val).strip()
+        return val in {"cancel", "/cancel", "back"} or cleaned in {"cancel", "/cancel", "back"}
+
+    def build_prompt_nav_keyboard():
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        markup.add("⬅️ Back", "❌ Cancel")
+        return markup
+
+    def build_skip_cancel_keyboard():
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        markup.add("⏭️ Skip", "❌ Cancel")
+        return markup
+
+    def send_prompt(chat_id, text, parse_mode=None):
+        return bot.send_message(
+            chat_id,
+            text,
+            reply_markup=build_prompt_nav_keyboard(),
+            parse_mode=parse_mode,
+        )
+
+    def send_skip_prompt(chat_id, text, parse_mode=None):
+        return bot.send_message(
+            chat_id,
+            text,
+            reply_markup=build_skip_cancel_keyboard(),
+            parse_mode=parse_mode,
+        )
+
+    def is_skip_text(text):
+        val = (text or "").strip().lower()
+        cleaned = re.sub(r'[^a-z0-9/ ]', '', val).strip()
+        return val in {"skip", "/skip"} or cleaned in {"skip", "/skip"}
+
+    def build_service_button_label(service_name, button_emoji=""):
+        service_name = str(service_name or "").strip() or "Unknown"
+        button_emoji = normalize_custom_emoji_text(button_emoji)
+        button_emoji = str(button_emoji or "").strip()
+        return f"{button_emoji} {service_name}".strip() if button_emoji else service_name
+
+    def strip_leading_button_emoji(service_name, button_emoji=""):
+        service_name = str(service_name or "").strip()
+        button_emoji = normalize_custom_emoji_text(button_emoji)
+        button_emoji = str(button_emoji or "").strip()
+        if button_emoji and service_name.startswith(button_emoji):
+            stripped = service_name[len(button_emoji):].strip()
+            if stripped:
+                return stripped
+        return service_name
+
+    def build_service_inline_button(service_name, callback_data, button_emoji="", custom_emoji_id="", suffix="", style=None):
+        button_emoji = normalize_custom_emoji_text(button_emoji)
+        button_emoji = str(button_emoji or "").strip()
+        custom_emoji_id = str(custom_emoji_id or "").strip()
+        label_name = str(service_name or "").strip() or "Unknown"
+        if custom_emoji_id:
+            text = f"{label_name}{suffix}"
+            kwargs = {"icon_custom_emoji_id": custom_emoji_id}
+            if style:
+                kwargs["style"] = style
+            return types.InlineKeyboardButton(text, callback_data=callback_data, **kwargs)
+        text = f"{build_service_button_label(label_name, button_emoji)}{suffix}"
+        kwargs = {}
+        if style:
+            kwargs["style"] = style
+        return types.InlineKeyboardButton(text, callback_data=callback_data, **kwargs)
+
+    def build_country_inline_button(country_label, callback_data, flag_text="", custom_emoji_id="", suffix="", style=None):
+        flag_text = normalize_custom_emoji_text(flag_text)
+        flag_text = str(flag_text or "").strip()
+        custom_emoji_id = str(custom_emoji_id or "").strip()
+        label_name = str(country_label or "").strip() or "Unknown"
+        if flag_text and label_name.startswith(flag_text):
+            label_name = label_name[len(flag_text):].strip() or label_name
+        if custom_emoji_id:
+            text = f"{label_name}{suffix}"
+            kwargs = {"icon_custom_emoji_id": custom_emoji_id}
+            if style:
+                kwargs["style"] = style
+            return types.InlineKeyboardButton(text, callback_data=callback_data, **kwargs)
+        text = f"{combine_country_display(flag_text, label_name)}{suffix}".strip()
+        kwargs = {}
+        if style:
+            kwargs["style"] = style
+        return types.InlineKeyboardButton(text, callback_data=callback_data, **kwargs)
 
     def apply_live_bot_token(new_token):
         """Try to apply new bot token without restarting process."""
@@ -235,6 +632,17 @@ def register_handlers(bot, get_db_connection, logger):
         if uid in forwarder_panel_users:
             return show_forwarder_panel(message)
         return show_admin_list_menu(message)
+
+    def show_service_emoji_menu(message):
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
+        markup.add('🎭 Add Service Emoji', '📋 View Service Emojis')
+        markup.add('⬅️ Back to Panel')
+        bot.send_message(
+            message.chat.id,
+            '🎭 <b>Service Emoji</b>\n\nChoose an option:',
+            reply_markup=markup,
+            parse_mode='HTML',
+        )
 
     def bot_name():
         from core import BOT_NAME
@@ -341,9 +749,10 @@ def register_handlers(bot, get_db_connection, logger):
         markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
         markup.add('🧩 Create Service', '➕ Add Numbers')
         markup.add('🗑️ Delete Service', '♻️ Reactivate Service')
-        markup.add('📊 Dashboard', '⚙️ Bot Settings')
-        markup.add('🔐 Access Control', '👥 User Management')
-        markup.add('📣 Broadcast', '🛠️ Bot Operations')
+        markup.add('🎭 Service Emoji', '📊 Dashboard')
+        markup.add('⚙️ Bot Settings', '🔐 Access Control')
+        markup.add('👥 User Management', '📣 Broadcast')
+        markup.add('🛠️ Bot Operations')
         markup.add('🚪 Exit Panel')
         bot.send_message(message.chat.id, f' <b>{bot_name()}</b>\n\nSelect an option:', reply_markup=markup, parse_mode='HTML')
 
@@ -354,6 +763,9 @@ def register_handlers(bot, get_db_connection, logger):
             'add numbers',
             'delete service',
             'reactivate service',
+            'service emoji',
+            'add service emoji',
+            'view service emojis',
             'dashboard',
             'bot settings',
             'database mgmt',
@@ -373,6 +785,9 @@ def register_handlers(bot, get_db_connection, logger):
             'add numbers': ask_service_name_for_add,
             'delete service': select_service_to_delete,
             'reactivate service': select_service_to_reactivate,
+            'service emoji': show_service_emoji_menu,
+            'add service emoji': add_service_emoji_prompt,
+            'view service emojis': view_service_emoji_mappings,
             'dashboard': show_dashboard,
             'bot settings': show_bot_settings,
             'database mgmt': show_database_management,
@@ -383,7 +798,9 @@ def register_handlers(bot, get_db_connection, logger):
             'bot operations': show_bot_operations,
             'exit panel': exit_admin_panel
         }
-        for key, handler in normalized_map.items():
+        if normalized in normalized_map:
+            return normalized_map[normalized](message)
+        for key, handler in sorted(normalized_map.items(), key=lambda item: len(item[0]), reverse=True):
             if key in normalized:
                 return handler(message)
 
@@ -453,13 +870,15 @@ def register_handlers(bot, get_db_connection, logger):
 
             photo_file_id = message.photo[-1].file_id
             caption = (message.caption or "").strip()
+            caption_entities = list(getattr(message, "caption_entities", None) or [])
             enqueue_broadcast(
                 message.from_user.id,
                 caption,
                 parse_mode='HTML' if caption else None,
                 title="Image Broadcast",
                 media_type="photo",
-                photo_file_id=photo_file_id
+                photo_file_id=photo_file_id,
+                caption_entities=caption_entities if caption_entities and not caption.lstrip().startswith("<") else None,
             )
             bot.send_message(
                 message.chat.id,
@@ -471,6 +890,7 @@ def register_handlers(bot, get_db_connection, logger):
             return
 
         broadcast_msg = (message.text or "").strip()
+        entities = list(getattr(message, "entities", None) or [])
 
         if not broadcast_msg:
             bot.send_message(message.chat.id, "⚠️ Message cannot be empty!")
@@ -481,8 +901,15 @@ def register_handlers(bot, get_db_connection, logger):
             'html': 'HTML',
         }
         parse_mode = parse_mode_map.get(format_type, None)
+        entity_payload = entities if entities and format_type == 'none' else None
 
-        enqueue_broadcast(message.from_user.id, broadcast_msg, parse_mode=parse_mode, title="Broadcast")
+        enqueue_broadcast(
+            message.from_user.id,
+            broadcast_msg,
+            parse_mode=parse_mode,
+            title="Broadcast",
+            entities=entity_payload,
+        )
         bot.send_message(message.chat.id, "✅ Broadcast queued. You will receive a status update when it finishes.", reply_markup=types.ReplyKeyboardRemove())
         logger.info(f"Broadcast queued by admin {message.from_user.id}, format: {format_type}")
         broadcast_menu(message)
@@ -494,14 +921,55 @@ def register_handlers(bot, get_db_connection, logger):
     # Create Service Flow
     def ask_service_name_for_new(message):
         msg = bot.send_message(message.chat.id, " Enter Service Name (you can include emojis, e.g.,  SMS,  Telegram):", reply_markup=types.ReplyKeyboardRemove())
-        bot.register_next_step_handler(msg, create_service_directly)
+        bot.register_next_step_handler(msg, create_service_name_step)
 
-    def create_service_directly(message):
-        service_name = message.text.strip()
+    def create_service_name_step(message):
+        service_name = (message.text or "").strip()
+        service_name = normalize_custom_emoji_text(service_name)
+        if is_cancel_text(service_name):
+            admin_panel(message)
+            return
         if not service_name:
             bot.send_message(message.chat.id, "⚠️ Service name cannot be empty.")
             return ask_service_name_for_new(message)
-        
+        msg = send_skip_prompt(
+            message.chat.id,
+            " Send button emoji / premium emoji / custom emoji ID.\n\nExamples:\n💬\nPremium emoji directly\n5280735970595971856\n\nThis is for menu/service buttons.\nTap Skip to keep it empty.",
+        )
+        bot.register_next_step_handler(msg, create_service_emoji_step, service_name)
+
+    def create_service_emoji_step(message, service_name):
+        raw = (message.text or "").strip()
+        if is_cancel_text(raw):
+            admin_panel(message)
+            return
+        emoji_text = ""
+        custom_emoji_id = ""
+        if not is_skip_text(raw):
+            emoji_text, custom_emoji_id = parse_service_emoji_input(message)
+            emoji_text = normalize_custom_emoji_text(emoji_text)
+            if custom_emoji_id and not emoji_text and is_raw_custom_emoji_id_input(message):
+                msg = send_skip_prompt(
+                    message.chat.id,
+                    " Send visible token for this button custom emoji.\n\nExamples:\n💬\n✈️\nWA\n\nDirect premium emoji does not need this step.\nTap Skip to keep token empty.",
+                )
+                bot.register_next_step_handler(msg, create_service_token_step, service_name, custom_emoji_id)
+                return
+        create_service_directly(message, service_name, emoji_text, custom_emoji_id)
+
+    def create_service_token_step(message, service_name, custom_emoji_id):
+        raw = (message.text or "").strip()
+        if is_cancel_text(raw):
+            admin_panel(message)
+            return
+        emoji_text = ""
+        if not is_skip_text(raw):
+            emoji_text = normalize_custom_emoji_text(raw)
+        create_service_directly(message, service_name, emoji_text, custom_emoji_id)
+
+    def create_service_directly(message, service_name, emoji_text="", custom_emoji_id=""):
+        button_emoji = normalize_custom_emoji_text(emoji_text)
+        service_name = strip_leading_button_emoji(service_name, button_emoji)
         try:
             with get_db_connection() as conn:
                 # Check if service already exists
@@ -511,11 +979,21 @@ def register_handlers(bot, get_db_connection, logger):
                     admin_panel(message)
                     return
                     
-                # Use a placeholder country for service creation
-                conn.execute("INSERT INTO services (name, country) VALUES (?, ?)", (service_name, "Global"))
+                conn.execute(
+                    "INSERT INTO services (name, country, button_emoji, service_emoji, service_custom_emoji_id) VALUES (?, ?, ?, ?, ?)",
+                    (service_name, "Global", button_emoji, "", ""),
+                )
+                save_service_button_emoji(service_name, button_emoji, custom_emoji_id=custom_emoji_id, conn=conn)
                 conn.commit()
             
-            bot.send_message(message.chat.id, f" <b>Service created!</b>\n\n <b>{service_name}</b>", reply_markup=types.ReplyKeyboardRemove())
+            button_preview = build_service_button_label(service_name, button_emoji)
+            custom_line = f"\nButton Custom ID: <code>{custom_emoji_id}</code>" if custom_emoji_id else ""
+            bot.send_message(
+                message.chat.id,
+                f" <b>Service Created</b>\n\n🧩 <b>{service_name}</b>\n🔘 Button Preview: <b>{button_preview}</b>{custom_line}\n\n🎭 Use <b>Service Emoji</b> if you want separate webhook / OTP premium emoji override.",
+                reply_markup=types.ReplyKeyboardRemove(),
+                parse_mode='HTML',
+            )
             logger.info(f"Service created: {service_name}")
             
             # Return to admin panel
@@ -529,8 +1007,9 @@ def register_handlers(bot, get_db_connection, logger):
         with get_db_connection() as conn:
             # Get unique service names (excluding placeholder "Global" country)
             services = conn.execute("""
-                SELECT DISTINCT s.name 
+                SELECT s.name
                 FROM services s 
+                GROUP BY s.name
                 ORDER BY s.name
             """).fetchall()
         
@@ -540,6 +1019,7 @@ def register_handlers(bot, get_db_connection, logger):
         
         markup = types.InlineKeyboardMarkup(row_width=2)
         for (service_name,) in services:
+            button_emoji, button_custom_emoji_id = get_service_button_icon_data(service_name)
             # Count total numbers across all countries for this service
             with get_db_connection() as conn:
                 count = conn.execute("""
@@ -547,11 +1027,16 @@ def register_handlers(bot, get_db_connection, logger):
                     JOIN services s ON n.service_id = s.id 
                     WHERE s.name = ? AND n.status = 'active'
                 """, (service_name,)).fetchone()[0]
-            
-            label = f"{service_name} ({count})"
-            markup.add(types.InlineKeyboardButton(label, callback_data=f"add_service_{service_name}"))
+            markup.add(
+                build_service_inline_button(
+                    service_name,
+                    callback_data=f"add_service_{service_name}",
+                    button_emoji=button_emoji,
+                    custom_emoji_id=button_custom_emoji_id,
+                    suffix=f" ({count})",
+                )
+            )
         
-        markup.add(types.InlineKeyboardButton(" Create New Service", callback_data="create_new_service"))
         markup.add(types.InlineKeyboardButton(" Cancel", callback_data="cancel_add"))
         
         send_or_edit(
@@ -566,25 +1051,37 @@ def register_handlers(bot, get_db_connection, logger):
         with get_db_connection() as conn:
             # Get countries that have this service
             countries = conn.execute("""
-                SELECT s.country, s.id, COUNT(n.id) as count
+                SELECT s.country, COALESCE(s.country_flag, ''), COALESCE(s.country_custom_emoji_id, ''), COALESCE(s.country_code, ''),
+                       COALESCE(s.country_display_name, ''), s.id, COUNT(n.id) as count
                 FROM services s
                 LEFT JOIN numbers n ON s.id = n.service_id AND n.status='active' AND n.user_id IS NULL
                 WHERE s.name = ? AND s.country != 'Global'
-                GROUP BY s.country, s.id
+                GROUP BY s.country, s.country_flag, s.country_custom_emoji_id, s.country_code, s.country_display_name, s.id
                 ORDER BY s.country
             """, (service_name,)).fetchall()
 
         markup = types.InlineKeyboardMarkup(row_width=2)
+        service_display = format_service_visible_label(service_name)
         
         text = ""
         if countries:
-            text += f" <b>Available countries for {service_name}:</b>\n\n"
-            for country, service_id, count in countries:
-                flag = get_country_flag(country)
-                label = f"{flag} {country} ({count})"
-                markup.add(types.InlineKeyboardButton(label, callback_data=f"add_to_country_{service_id}"))
+            text += f" <b>Available countries for {service_display}:</b>\n\n"
+            for country, country_flag, country_custom_emoji_id, country_code, country_display_name, service_id, count in countries:
+                meta = make_country_meta(country_flag, country_code, country_display_name or country, custom_emoji_id=country_custom_emoji_id)
+                country_label = meta["display_name"] or country
+                if meta["code"]:
+                    country_label = f"{country_label} [{meta['code']}]"
+                markup.add(
+                    build_country_inline_button(
+                        country_label or country,
+                        callback_data=f"add_to_country_{service_id}",
+                        flag_text=country_flag,
+                        custom_emoji_id=country_custom_emoji_id,
+                        suffix=f" ({count})",
+                    )
+                )
         else:
-            text += f" <b>No countries yet for {service_name}:</b>\n\n"
+            text += f" <b>No countries yet for {service_display}:</b>\n\n"
         
         # Always offer to add new country
         markup.add(types.InlineKeyboardButton(" Add New Country", callback_data=f"add_new_country_{service_name}"))
@@ -603,12 +1100,192 @@ def register_handlers(bot, get_db_connection, logger):
             edit_msg_id=edit_msg_id
         )
 
-    def ask_for_numbers_file(message, country_name=None, service_name=None, service_id=None):
-        flag = get_country_flag(country_name) if country_name else ""
-        msg = bot.send_message(message.chat.id, f" Send numbers for {flag} {country_name} - {service_name}:\n\n You can send:\n Text message with numbers (one per line)\n .txt file with numbers\n .xlsx file (numbers in Column A)", reply_markup=types.ReplyKeyboardRemove())
-        bot.register_next_step_handler(msg, process_and_save_numbers, country_name, service_name, service_id)
+    def ask_for_numbers_file(message, country_info=None, service_name=None, service_id=None):
+        country_info = country_info or {}
+        country_display = format_country_display(
+            country_info.get("display_name") or country_info.get("display_country") or "",
+            html=True,
+            flag_text=country_info.get("flag") if country_info else "",
+            custom_emoji_id=country_info.get("custom_emoji_id") if country_info else "",
+        ) if country_info else ""
+        service_display = service_name or "Unknown"
+        if service_id:
+            try:
+                with get_db_connection() as conn:
+                    row = conn.execute(
+                        "SELECT name, COALESCE(service_emoji, ''), COALESCE(service_custom_emoji_id, '') FROM services WHERE id = ?",
+                        (service_id,),
+                    ).fetchone()
+                    if row:
+                        service_display = format_service_label(row[0], row[1], row[2], html=True)
+            except Exception:
+                pass
+        msg = bot.send_message(message.chat.id, f" Send numbers for {country_display} - {service_display}:\n\n You can send:\n Text message with numbers (one per line)\n .txt file with numbers\n .xlsx file (numbers in Column A)", reply_markup=types.ReplyKeyboardRemove())
+        bot.register_next_step_handler(msg, process_and_save_numbers, country_info, service_name, service_id)
 
-    def process_and_save_numbers(message, country_name, service_name, service_id=None):
+    def add_service_emoji_prompt(message):
+        try:
+            with get_db_connection() as conn:
+                row = conn.execute("SELECT COUNT(*) FROM services").fetchone()
+                service_count = int(row[0] or 0) if row else 0
+        except Exception:
+            service_count = 0
+        if service_count <= 0:
+            bot.send_message(
+                message.chat.id,
+                "ℹ️ No service exists yet.\n\nCreate one first from `🧩 Create Service`, then come back to `🎭 Service Emoji`.",
+                parse_mode='Markdown',
+                reply_markup=types.ReplyKeyboardRemove(),
+            )
+            return admin_panel(message)
+        msg = send_prompt(
+            message.chat.id,
+            "🎭 Enter service name first.\n\nExample: Telegram\n\nTap Back or Cancel to stop.",
+        )
+        bot.register_next_step_handler(msg, process_service_emoji_service_name)
+
+    def process_service_emoji_service_name(message):
+        service_name = (message.text or "").strip()
+        service_name = normalize_custom_emoji_text(service_name)
+        if is_cancel_text(service_name):
+            return show_service_emoji_menu(message)
+        if not service_name:
+            bot.send_message(message.chat.id, "⚠️ Service name cannot be empty.")
+            return add_service_emoji_prompt(message)
+        current_emoji = get_service_emoji_override(service_name)
+        current_text = f"\n\nCurrent emoji: {current_emoji}" if current_emoji else ""
+        msg = send_prompt(
+            message.chat.id,
+            f"🎭 Send emoji for {service_name}.{current_text}\n\nYou can send:\n1. Normal emoji/text like: 💬\n2. Custom emoji ID like: 5368324170671202286\n3. Premium emoji directly\n\nTap Back or Cancel to stop.",
+        )
+        bot.register_next_step_handler(msg, process_service_emoji_input, service_name)
+
+    def process_service_emoji_input(message, service_name):
+        raw_text = (message.text or "").strip()
+        if is_cancel_text(raw_text):
+            return show_service_emoji_menu(message)
+        emoji_text, custom_emoji_id = parse_service_emoji_input(message)
+        if not emoji_text and not custom_emoji_id:
+            bot.send_message(message.chat.id, "⚠️ Emoji cannot be empty.")
+            return add_service_emoji_prompt(message)
+        if custom_emoji_id and not emoji_text and is_raw_custom_emoji_id_input(message):
+            msg = send_skip_prompt(
+                message.chat.id,
+                f"🎭 Send visible token for {service_name}.\n\nExamples:\n💬\n🇱🇷\n✈️\n\nDirect premium emoji does not need this step.\nTap Skip to keep token empty.",
+            )
+            bot.register_next_step_handler(msg, process_service_emoji_token, service_name, custom_emoji_id)
+            return
+        try:
+            save_service_emoji_override(service_name, emoji_text, custom_emoji_id=custom_emoji_id)
+            display_label = format_service_label(
+                service_name,
+                emoji_text,
+                service_custom_emoji_id=custom_emoji_id,
+                html=True,
+            )
+            custom_line = f"\nCustom ID: <code>{custom_emoji_id}</code>" if custom_emoji_id else ""
+            bot.send_message(
+                message.chat.id,
+                f"✅ Service emoji saved.\n\nService: <b>{service_name}</b>\nDisplay: {display_label}{custom_line}",
+                parse_mode='HTML',
+                reply_markup=types.ReplyKeyboardRemove(),
+            )
+        except Exception as e:
+            logger.error(f"Service emoji save failed: {e}")
+            bot.send_message(message.chat.id, f"❌ Failed to save service emoji: {e}", reply_markup=types.ReplyKeyboardRemove())
+        show_service_emoji_menu(message)
+
+    def process_service_emoji_token(message, service_name, custom_emoji_id):
+        raw_text = (message.text or "").strip()
+        if is_cancel_text(raw_text):
+            return show_service_emoji_menu(message)
+        emoji_text = ""
+        if not is_skip_text(raw_text):
+            emoji_text = normalize_custom_emoji_text(raw_text)
+        try:
+            save_service_emoji_override(service_name, emoji_text, custom_emoji_id=custom_emoji_id)
+            display_label = format_service_label(
+                service_name,
+                emoji_text,
+                service_custom_emoji_id=custom_emoji_id,
+                html=True,
+            )
+            custom_line = f"\nCustom ID: <code>{custom_emoji_id}</code>" if custom_emoji_id else ""
+            bot.send_message(
+                message.chat.id,
+                f"✅ Service emoji saved.\n\nService: <b>{service_name}</b>\nDisplay: {display_label}{custom_line}",
+                parse_mode='HTML',
+                reply_markup=types.ReplyKeyboardRemove(),
+            )
+        except Exception as e:
+            logger.error(f"Service emoji token save failed: {e}")
+            bot.send_message(message.chat.id, f"❌ Failed to save service emoji: {e}", reply_markup=types.ReplyKeyboardRemove())
+        show_service_emoji_menu(message)
+
+    def view_service_emoji_mappings(message, edit_msg_id=None):
+        with get_db_connection() as conn:
+            mappings = conn.execute(
+                "SELECT service_name, service_emoji, COALESCE(custom_emoji_id, '') "
+                "FROM service_emoji_overrides ORDER BY service_name"
+            ).fetchall()
+        if not mappings:
+            bot.send_message(message.chat.id, "ℹ️ No saved service emojis yet.", reply_markup=types.ReplyKeyboardRemove())
+            return show_service_emoji_menu(message)
+
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        text = "📋 <b>Saved Service Emojis</b>\n\n"
+        for service_name, service_emoji, custom_emoji_id in mappings:
+            display_label = format_service_label(
+                service_name,
+                service_emoji,
+                service_custom_emoji_id=custom_emoji_id,
+                html=True,
+            )
+            text += f"Service: <b>{service_name}</b>\nDisplay: {display_label}\n"
+            if custom_emoji_id:
+                text += f"Custom ID: <code>{custom_emoji_id}</code>\n"
+            text += "\n"
+            markup.add(
+                types.InlineKeyboardButton(
+                    f"Remove {service_name}",
+                    callback_data=f"remove_service_emoji_{service_name}",
+                )
+            )
+        markup.add(types.InlineKeyboardButton(" Close", callback_data="cancel_service_emoji"))
+        send_or_edit(message.chat.id, text, reply_markup=markup, parse_mode='HTML', edit_msg_id=edit_msg_id)
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("remove_service_emoji_"))
+    def handle_remove_service_emoji(call):
+        service_name = call.data.replace("remove_service_emoji_", "")
+        try:
+            remove_service_emoji_override(service_name)
+            bot.edit_message_text(
+                f"✅ Service emoji removed.\n\nService: <b>{service_name}</b>\nNow it will show the service name everywhere.",
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode='HTML',
+            )
+        except Exception as e:
+            logger.error(f"Service emoji remove failed: {e}")
+            bot.edit_message_text(f"❌ Failed to remove service emoji: {e}", call.message.chat.id, call.message.message_id)
+        answer_cbq(call)
+
+    @bot.callback_query_handler(func=lambda call: call.data == "cancel_service_emoji")
+    def cancel_service_emoji(call):
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
+        show_service_emoji_menu(call.message)
+        answer_cbq(call)
+
+    def process_and_save_numbers(message, country_info, service_name, service_id=None):
+        country_info = country_info or {}
+        country_name = country_info.get("display_name") or country_info.get("display_country") or "Unknown"
+        country_flag = str(country_info.get("flag") or "").strip()
+        country_custom_emoji_id = str(country_info.get("custom_emoji_id") or "").strip()
+        country_code = normalize_country_code_value(country_info.get("code"))
+        country_display_name = str(country_info.get("display_name") or "").strip() or country_name
         numbers = []
         content = ""
         if message.document:
@@ -668,16 +1345,51 @@ def register_handlers(bot, get_db_connection, logger):
         with get_db_connection() as conn:
             c = conn.cursor()
             
-            # Get or create service (match by both country and service name)
-            c.execute("SELECT id FROM services WHERE UPPER(TRIM(country)) = UPPER(TRIM(?)) AND UPPER(TRIM(name)) = UPPER(TRIM(?))", (country_name, service_name))
+            # Get or create service using short code when available; country text is display-only.
+            if country_code:
+                c.execute(
+                    "SELECT id FROM services WHERE UPPER(TRIM(COALESCE(country_code, ''))) = UPPER(TRIM(?)) "
+                    "AND UPPER(TRIM(name)) = UPPER(TRIM(?))",
+                    (country_code, service_name),
+                )
+            else:
+                c.execute(
+                    "SELECT id FROM services WHERE UPPER(TRIM(country)) = UPPER(TRIM(?)) "
+                    "AND UPPER(TRIM(name)) = UPPER(TRIM(?))",
+                    (country_name, service_name),
+                )
             service = c.fetchone()
 
             if service:
                 service_id = service[0]
             else:
-                c.execute("INSERT INTO services (name, country) VALUES (?, ?)", (service_name, country_name))
+                inherited = conn.execute(
+                    "SELECT COALESCE(button_emoji, ''), COALESCE(service_emoji, ''), COALESCE(service_custom_emoji_id, '') "
+                    "FROM services WHERE UPPER(TRIM(name)) = UPPER(TRIM(?)) "
+                    "ORDER BY CASE WHEN country = 'Global' THEN 0 ELSE 1 END, id LIMIT 1",
+                    (service_name,),
+                ).fetchone()
+                button_emoji = str(inherited[0] or "").strip() if inherited else ""
+                service_emoji = str(inherited[1] or "").strip() if inherited else button_emoji
+                custom_emoji_id = str(inherited[2] or "").strip() if inherited else ""
+                c.execute(
+                    "INSERT INTO services (name, country, country_flag, country_custom_emoji_id, country_code, country_display_name, button_emoji, service_emoji, service_custom_emoji_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (service_name, country_name, country_flag, country_custom_emoji_id, country_code, country_display_name, button_emoji, service_emoji, custom_emoji_id),
+                )
                 conn.commit()
-                service_id = c.lastrowid
+                if country_code:
+                    service_id = c.execute(
+                        "SELECT id FROM services WHERE UPPER(TRIM(COALESCE(country_code, ''))) = UPPER(TRIM(?)) "
+                        "AND UPPER(TRIM(name)) = UPPER(TRIM(?))",
+                        (country_code, service_name),
+                    ).fetchone()[0]
+                else:
+                    service_id = c.execute(
+                        "SELECT id FROM services WHERE UPPER(TRIM(country)) = UPPER(TRIM(?)) "
+                        "AND UPPER(TRIM(name)) = UPPER(TRIM(?))",
+                        (country_name, service_name),
+                    ).fetchone()[0]
 
             # Check for duplicates
             existing = set()
@@ -688,27 +1400,51 @@ def register_handlers(bot, get_db_connection, logger):
             duplicates = len(numbers) - len(new_numbers)
 
             # Get country flag for preview
-            flag = get_country_flag(country_name, sample_numbers=numbers)
+            country_display = format_country_visible_label(
+                country_name,
+                flag_text=country_info.get("flag"),
+                custom_emoji_id=country_info.get("custom_emoji_id"),
+            )
 
             # Show preview
-            preview_text = f" <b>Preview:</b>\n\n{flag} Country: <b>{country_name}</b>\n Service: <b>{service_name}</b>\n\n"
-            preview_text += f"New Numbers: <b>{len(new_numbers)}</b>\n"
+            service_row = c.execute(
+                "SELECT name, COALESCE(service_emoji, ''), COALESCE(service_custom_emoji_id, '') FROM services WHERE id = ?",
+                (service_id,),
+            ).fetchone()
+            service_display = format_service_visible_label(
+                service_row[0] if service_row else service_name,
+                service_row[1] if service_row else "",
+            )
+            preview_text = " <b>Preview</b>\n\n"
+            preview_text += f"🌍 <b>{country_display}</b>\n"
+            preview_text += f"🧩 <b>{service_display}</b>\n\n"
+            preview_text += f"➕ New Numbers: <b>{len(new_numbers)}</b>\n"
             if duplicates > 0:
-                preview_text += f"Duplicates (skipped): <b>{duplicates}</b>\n"
-            preview_text += f"\nTotal to add: <b>{len(new_numbers)}</b>\n\n"
+                preview_text += f"♻️ Duplicates Skipped: <b>{duplicates}</b>\n"
+            preview_text += f"📦 Total To Add: <b>{len(new_numbers)}</b>\n\n"
             
             if len(new_numbers) > 100:
-                preview_text += f" <b>Warning:</b> Adding {len(new_numbers)} numbers. This may take a moment.\n\n"
+                preview_text += f"⚠️ <b>Warning:</b> Adding {len(new_numbers)} numbers. This may take a moment.\n\n"
             
-            preview_text += "Confirm to add these numbers:"
+            preview_text += "Confirm to add these numbers."
             
             markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
             markup.add(" Confirm", " Cancel")
             
-            msg = bot.send_message(message.chat.id, preview_text, reply_markup=markup)
-            bot.register_next_step_handler(msg, confirm_save_numbers, service_id, new_numbers, service_name, country_name, duplicates)
+            msg = bot.send_message(message.chat.id, preview_text, reply_markup=markup, parse_mode='HTML')
+            bot.register_next_step_handler(
+                msg,
+                confirm_save_numbers,
+                service_id,
+                new_numbers,
+                service_name,
+                country_info,
+                duplicates,
+            )
 
-    def confirm_save_numbers(message, service_id, numbers, service_name, country_name, duplicates):
+    def confirm_save_numbers(message, service_id, numbers, service_name, country_info, duplicates):
+        country_info = country_info or {}
+        country_name = country_info.get("display_name") or country_info.get("display_country") or "Unknown"
         # ReplyKeyboard button labels in this file often include leading spaces for UI.
         # Some Telegram clients (or user typing) may omit/trim those spaces, so normalize.
         raw_choice = (message.text or "").strip().lower()
@@ -726,13 +1462,25 @@ def register_handlers(bot, get_db_connection, logger):
                 c.executemany("INSERT INTO numbers (service_id, number) VALUES (?, ?)", [(service_id, num) for num in numbers])
                 conn.commit()
                 
-                result_text = f"✅ <b>Success!</b>\n\n"
-                result_text += f"Added: <b>{len(numbers)}</b>\n"
+                country_display = format_country_visible_label(
+                    country_name,
+                    flag_text=country_info.get("flag"),
+                    custom_emoji_id=country_info.get("custom_emoji_id"),
+                )
+                result_text = f"✅ <b>Numbers Added</b>\n\n"
+                result_text += f"🌍 <b>{country_display}</b>\n"
                 if duplicates > 0:
-                    result_text += f"Duplicates (skipped): <b>{duplicates}</b>\n"
-                result_text += f"Service: <b>{service_name}</b>"
+                    result_text += f"♻️ Duplicates Skipped: <b>{duplicates}</b>\n"
+                service_row = c.execute(
+                    "SELECT name, COALESCE(service_emoji, ''), COALESCE(service_custom_emoji_id, '') FROM services WHERE id = ?",
+                    (service_id,),
+                ).fetchone()
+                result_text += (
+                    f"🧩 <b>{format_service_visible_label(service_row[0] if service_row else service_name, service_row[1] if service_row else '')}</b>\n"
+                )
+                result_text += f"➕ Added: <b>{len(numbers)}</b>"
                 
-                bot.send_message(message.chat.id, result_text, reply_markup=types.ReplyKeyboardRemove())
+                bot.send_message(message.chat.id, result_text, reply_markup=types.ReplyKeyboardRemove(), parse_mode='HTML')
                 
                 # Get users list before closing connection
                 users = c.execute("""
@@ -750,16 +1498,35 @@ def register_handlers(bot, get_db_connection, logger):
                 return
         # Automatic broadcast to all users (queued in background)
         if users:
-            flag = get_country_flag(country_name)
-            broadcast_text = f""" <b>New Numbers Available!</b>
+            country_display = format_country_visible_label(
+                country_name,
+                flag_text=country_info.get("flag"),
+                custom_emoji_id=country_info.get("custom_emoji_id"),
+            )
+            service_emoji = ""
+            service_custom_emoji_id = ""
+            try:
+                with get_db_connection() as conn:
+                    row = conn.execute(
+                        "SELECT COALESCE(service_emoji, ''), COALESCE(service_custom_emoji_id, '') FROM services WHERE id = ?",
+                        (service_id,),
+                    ).fetchone()
+                    service_emoji = row[0] if row else ""
+                    service_custom_emoji_id = row[1] if row else ""
+            except Exception:
+                pass
+            broadcast_text, broadcast_entities = build_service_country_summary_entities(
+                "New Numbers Available!",
+                country_label=country_name,
+                country_flag=country_info.get("flag"),
+                country_custom_emoji_id=country_info.get("custom_emoji_id"),
+                service_name=service_name,
+                service_emoji=service_emoji,
+                service_custom_emoji_id=service_custom_emoji_id,
+                total_added=len(numbers),
+            )
 
-{flag} <b>{country_name}</b>
- Service: <b>{service_name}</b>
- Total Added: <b>{len(numbers)}</b>
-
- Use /start to get your numbers!"""
-
-            enqueue_broadcast(message.from_user.id, broadcast_text, parse_mode="HTML", title="Auto Broadcast")
+            enqueue_broadcast(message.from_user.id, broadcast_text, parse_mode=None, title="Auto Broadcast", entities=broadcast_entities)
             logger.info(f"Numbers added: {len(numbers)} for {country_name}-{service_name}, auto broadcast queued")
 
         admin_panel(message)
@@ -789,7 +1556,15 @@ def register_handlers(bot, get_db_connection, logger):
         text = " <b>Select a service to delete:</b>\n\n"
 
         for service_name, country_count, total_numbers, total_uses in services:
-            markup.add(types.InlineKeyboardButton(service_name, callback_data=f"del_service_name_{service_name}"))
+            button_emoji, button_custom_emoji_id = get_service_button_icon_data(service_name)
+            markup.add(
+                build_service_inline_button(
+                    service_name,
+                    callback_data=f"del_service_name_{service_name}",
+                    button_emoji=button_emoji,
+                    custom_emoji_id=button_custom_emoji_id,
+                )
+            )
 
         markup.add(types.InlineKeyboardButton(" Cancel", callback_data="cancel_delete"))
 
@@ -819,7 +1594,15 @@ def register_handlers(bot, get_db_connection, logger):
         text = " <b>Select a service to reactivate:</b>\n\n"
 
         for service_name, country_count, total_numbers, total_uses in services:
-            markup.add(types.InlineKeyboardButton(service_name, callback_data=f"reactivate_service_name_{service_name}"))
+            button_emoji, button_custom_emoji_id = get_service_button_icon_data(service_name)
+            markup.add(
+                build_service_inline_button(
+                    service_name,
+                    callback_data=f"reactivate_service_name_{service_name}",
+                    button_emoji=button_emoji,
+                    custom_emoji_id=button_custom_emoji_id,
+                )
+            )
 
         markup.add(types.InlineKeyboardButton(" Cancel", callback_data="cancel_reactivate"))
 
@@ -831,7 +1614,11 @@ def register_handlers(bot, get_db_connection, logger):
             countries = conn.execute("""
                 SELECT s.country, s.id, COUNT(n.id) as num_count,
                        SUM(n.received_otp) as total_uses,
-                       COUNT(CASE WHEN n.user_id IS NOT NULL THEN 1 END) as assigned_count
+                       COUNT(CASE WHEN n.user_id IS NOT NULL THEN 1 END) as assigned_count,
+                       MAX(COALESCE(s.country_flag, '')) as country_flag,
+                       MAX(COALESCE(s.country_custom_emoji_id, '')) as country_custom_emoji_id,
+                       MAX(COALESCE(s.service_emoji, '')) as service_emoji,
+                       MAX(COALESCE(s.service_custom_emoji_id, '')) as service_custom_emoji_id
                 FROM services s
                 LEFT JOIN numbers n ON s.id = n.service_id
                 WHERE s.name = ? AND s.status = 'active'
@@ -845,20 +1632,28 @@ def register_handlers(bot, get_db_connection, logger):
 
         markup = types.InlineKeyboardMarkup(row_width=1)
 
-        text = f" <b>Select country for {service_name}:</b>\n\n"
+        service_display = format_service_label(service_name, html=True)
+        text = f" <b>Select country for {service_display}:</b>\n\n"
 
-        for country, service_id, num_count, total_uses, assigned_count in countries:
-            flag = get_country_flag(country)
+        for country, service_id, num_count, total_uses, assigned_count, country_flag, country_custom_emoji_id, _service_emoji, _service_custom_emoji_id in countries:
             total_uses = int(total_uses) if total_uses else 0
             assigned_count = int(assigned_count) if assigned_count else 0
-            label = f"{flag} {country} - {num_count} numbers ({assigned_count} assigned)"
+            label = f"{format_country_display(country, html=True, custom_emoji_id=country_custom_emoji_id, flag_text=country_flag)} - {num_count} numbers ({assigned_count} assigned)"
             text += f"  {label}\n    Uses: {total_uses}\n\n"
-            markup.add(types.InlineKeyboardButton(label, callback_data=f"del_country_{service_id}"))
+            markup.add(
+                build_country_inline_button(
+                    country,
+                    callback_data=f"del_country_{service_id}",
+                    flag_text=country_flag,
+                    custom_emoji_id=country_custom_emoji_id,
+                    suffix=f" - {num_count} numbers ({assigned_count} assigned)",
+                )
+            )
 
         markup.add(types.InlineKeyboardButton(" Back to Services", callback_data="back_to_service_delete"))
         markup.add(types.InlineKeyboardButton(" Cancel", callback_data="cancel_delete"))
 
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='HTML')
 
     def select_country_for_service_reactivate(call, service_name):
         with get_db_connection() as conn:
@@ -866,7 +1661,11 @@ def register_handlers(bot, get_db_connection, logger):
             countries = conn.execute("""
                 SELECT s.country, s.id, COUNT(n.id) as num_count,
                        SUM(n.received_otp) as total_uses,
-                       COUNT(CASE WHEN n.user_id IS NOT NULL THEN 1 END) as assigned_count
+                       COUNT(CASE WHEN n.user_id IS NOT NULL THEN 1 END) as assigned_count,
+                       MAX(COALESCE(s.country_flag, '')) as country_flag,
+                       MAX(COALESCE(s.country_custom_emoji_id, '')) as country_custom_emoji_id,
+                       MAX(COALESCE(s.service_emoji, '')) as service_emoji,
+                       MAX(COALESCE(s.service_custom_emoji_id, '')) as service_custom_emoji_id
                 FROM services s
                 LEFT JOIN numbers n ON s.id = n.service_id
                 WHERE s.name = ? AND s.status = 'inactive'
@@ -880,20 +1679,28 @@ def register_handlers(bot, get_db_connection, logger):
 
         markup = types.InlineKeyboardMarkup(row_width=1)
 
-        text = f" <b>Select country to reactivate for {service_name}:</b>\n\n"
+        service_display = format_service_label(service_name, html=True)
+        text = f" <b>Select country to reactivate for {service_display}:</b>\n\n"
 
-        for country, service_id, num_count, total_uses, assigned_count in countries:
-            flag = get_country_flag(country)
+        for country, service_id, num_count, total_uses, assigned_count, country_flag, country_custom_emoji_id, _service_emoji, _service_custom_emoji_id in countries:
             total_uses = int(total_uses) if total_uses else 0
             assigned_count = int(assigned_count) if assigned_count else 0
-            label = f"{flag} {country} - {num_count} numbers ({assigned_count} assigned)"
+            label = f"{format_country_display(country, html=True, custom_emoji_id=country_custom_emoji_id, flag_text=country_flag)} - {num_count} numbers ({assigned_count} assigned)"
             text += f"  {label}\n    Uses: {total_uses}\n\n"
-            markup.add(types.InlineKeyboardButton(label, callback_data=f"reactivate_country_{service_id}"))
+            markup.add(
+                build_country_inline_button(
+                    country,
+                    callback_data=f"reactivate_country_{service_id}",
+                    flag_text=country_flag,
+                    custom_emoji_id=country_custom_emoji_id,
+                    suffix=f" - {num_count} numbers ({assigned_count} assigned)",
+                )
+            )
 
         markup.add(types.InlineKeyboardButton(" Back to Services", callback_data="back_to_service_reactivate"))
         markup.add(types.InlineKeyboardButton(" Cancel", callback_data="cancel_reactivate"))
 
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='HTML')
 
     def show_delete_methods_for_service_name(call, service_name):
         # Get service-wide statistics
@@ -902,13 +1709,15 @@ def register_handlers(bot, get_db_connection, logger):
                 SELECT COUNT(n.id) as total_numbers,
                        COUNT(CASE WHEN n.user_id IS NOT NULL THEN 1 END) as assigned_count,
                        SUM(n.received_otp) as total_uses,
-                       COUNT(DISTINCT s.country) as country_count
+                       COUNT(DISTINCT s.country) as country_count,
+                       MAX(COALESCE(s.service_emoji, '')) as service_emoji,
+                       MAX(COALESCE(s.service_custom_emoji_id, '')) as service_custom_emoji_id
                 FROM services s
                 LEFT JOIN numbers n ON s.id = n.service_id
                 WHERE s.name = ?
             """, (service_name,)).fetchone()
 
-        total_numbers, assigned_count, total_uses, country_count = stats
+        total_numbers, assigned_count, total_uses, country_count, service_emoji, service_custom_emoji_id = stats
         total_numbers = int(total_numbers) if total_numbers else 0
         assigned_count = int(assigned_count) if assigned_count else 0
         total_uses = int(total_uses) if total_uses else 0
@@ -921,7 +1730,7 @@ def register_handlers(bot, get_db_connection, logger):
         )
         markup.add(types.InlineKeyboardButton(" Cancel", callback_data="cancel_delete"))
 
-        text = f" <b>DELETE SERVICE: {service_name}</b>\n\n"
+        text = f" <b>DELETE SERVICE: {format_service_label(service_name, service_emoji, service_custom_emoji_id, html=True)}</b>\n\n"
         text += f"Countries: {country_count}\n"
         text += f"Numbers: {total_numbers} total, {assigned_count} assigned\n"
         text += f"Total Usage: {total_uses} times\n\n"
@@ -930,7 +1739,7 @@ def register_handlers(bot, get_db_connection, logger):
         text += " <b>HARD DELETE</b> - Remove service entirely\n"
         text += " <b>SOFT DELETE</b> - Deactivate all countries"
 
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='HTML')
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("del_service_name_"))
     def handle_service_name_selection(call):
@@ -955,7 +1764,7 @@ def register_handlers(bot, get_db_connection, logger):
 
         with get_db_connection() as conn:
             service = conn.execute("""
-                SELECT s.name, s.country, COUNT(n.id) as num_count,
+                SELECT s.name, s.country, COALESCE(s.country_flag, ''), COALESCE(s.country_custom_emoji_id, ''), COALESCE(s.country_display_name, ''), COUNT(n.id) as num_count,
                        COUNT(CASE WHEN n.user_id IS NOT NULL THEN 1 END) as assigned_count,
                        SUM(n.received_otp) as total_uses
                 FROM services s
@@ -964,8 +1773,7 @@ def register_handlers(bot, get_db_connection, logger):
             """, (service_id,)).fetchone()
 
         if service:
-            name, country, num_count, assigned_count, total_uses = service
-            flag = get_country_flag(country)
+            name, country, country_flag, country_custom_emoji_id, country_display_name, num_count, assigned_count, total_uses = service
             total_uses = int(total_uses) if total_uses else 0
             assigned_count = int(assigned_count) if assigned_count else 0
 
@@ -976,8 +1784,9 @@ def register_handlers(bot, get_db_connection, logger):
             )
             markup.add(types.InlineKeyboardButton(" Cancel", callback_data="cancel_delete"))
 
+            country_label = country_display_name or country
             text = f" <b>DELETE SERVICE INSTANCE</b>\n\n"
-            text += f"Service: <b>{name}</b> ({flag} {country})\n"
+            text += f"Service: <b>{name}</b> ({format_country_display(country_label, html=True, custom_emoji_id=country_custom_emoji_id, flag_text=country_flag)})\n"
             text += f"Numbers: {num_count} total, {assigned_count} assigned\n"
             text += f"Total Usage: {total_uses} times\n\n"
 
@@ -985,7 +1794,7 @@ def register_handlers(bot, get_db_connection, logger):
             text += " <b>HARD DELETE</b> - Remove service & all numbers permanently\n"
             text += " <b>SOFT DELETE</b> - Deactivate service (users can't get new numbers)"
 
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='HTML')
 
         answer_cbq(call)
 
@@ -995,7 +1804,7 @@ def register_handlers(bot, get_db_connection, logger):
 
         with get_db_connection() as conn:
             service = conn.execute("""
-                SELECT s.name, s.country, COUNT(n.id) as num_count,
+                SELECT s.name, s.country, COALESCE(s.country_flag, ''), COALESCE(s.country_custom_emoji_id, ''), COALESCE(s.country_display_name, ''), COUNT(n.id) as num_count,
                        COUNT(CASE WHEN n.user_id IS NOT NULL THEN 1 END) as assigned_count
                 FROM services s
                 LEFT JOIN numbers n ON s.id = n.service_id
@@ -1003,8 +1812,7 @@ def register_handlers(bot, get_db_connection, logger):
             """, (service_id,)).fetchone()
 
         if service:
-            name, country, num_count, assigned_count = service
-            flag = get_country_flag(country)
+            name, country, country_flag, country_custom_emoji_id, country_display_name, num_count, assigned_count = service
             assigned_count = int(assigned_count) if assigned_count else 0
 
             markup = types.InlineKeyboardMarkup(row_width=2)
@@ -1013,8 +1821,9 @@ def register_handlers(bot, get_db_connection, logger):
                 types.InlineKeyboardButton(" Cancel", callback_data="cancel_delete")
             )
 
+            country_label = country_display_name or country
             text = f" <b>CONFIRM HARD DELETE</b>\n\n"
-            text += f"Target: <b>{name}</b> ({flag} {country})\n"
+            text += f"Target: <b>{name}</b> ({format_country_display(country_label, html=True, custom_emoji_id=country_custom_emoji_id, flag_text=country_flag)})\n"
             text += f"Action: Permanent deletion\n\n"
             text += f"IMPACT:\n"
             text += f" {num_count} numbers will be deleted\n"
@@ -1022,7 +1831,7 @@ def register_handlers(bot, get_db_connection, logger):
             text += f" All service data will be lost forever\n\n"
             text += f" This action CANNOT be undone!"
 
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='HTML')
 
         answer_cbq(call)
 
@@ -1032,7 +1841,7 @@ def register_handlers(bot, get_db_connection, logger):
 
         with get_db_connection() as conn:
             service = conn.execute("""
-                SELECT s.name, s.country, COUNT(n.id) as num_count,
+                SELECT s.name, s.country, COALESCE(s.country_flag, ''), COALESCE(s.country_custom_emoji_id, ''), COALESCE(s.country_display_name, ''), COUNT(n.id) as num_count,
                        COUNT(CASE WHEN n.user_id IS NOT NULL THEN 1 END) as assigned_count
                 FROM services s
                 LEFT JOIN numbers n ON s.id = n.service_id
@@ -1040,8 +1849,7 @@ def register_handlers(bot, get_db_connection, logger):
             """, (service_id,)).fetchone()
 
         if service:
-            name, country, num_count, assigned_count = service
-            flag = get_country_flag(country)
+            name, country, country_flag, country_custom_emoji_id, country_display_name, num_count, assigned_count = service
             assigned_count = int(assigned_count) if assigned_count else 0
 
             markup = types.InlineKeyboardMarkup(row_width=2)
@@ -1050,8 +1858,9 @@ def register_handlers(bot, get_db_connection, logger):
                 types.InlineKeyboardButton(" Cancel", callback_data="cancel_delete")
             )
 
+            country_label = country_display_name or country
             text = f" <b>CONFIRM SOFT DELETE</b>\n\n"
-            text += f"Target: <b>{name}</b> ({flag} {country})\n"
+            text += f"Target: <b>{name}</b> ({format_country_display(country_label, html=True, custom_emoji_id=country_custom_emoji_id, flag_text=country_flag)})\n"
             text += f"Action: Deactivate service\n\n"
             text += f"WHAT HAPPENS:\n"
             text += f" Service hidden from user selection\n"
@@ -1061,7 +1870,7 @@ def register_handlers(bot, get_db_connection, logger):
             text += f" Can reactivate service later\n\n"
             text += f"Active numbers: {assigned_count}"
 
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='HTML')
 
         answer_cbq(call)
 
@@ -1238,18 +2047,23 @@ def register_handlers(bot, get_db_connection, logger):
 
         try:
             with get_db_connection() as conn:
-                service = conn.execute("SELECT name, country FROM services WHERE id=?", (service_id,)).fetchone()
+                service = conn.execute(
+                    "SELECT name, country, COALESCE(country_flag, ''), COALESCE(country_display_name, ''), COALESCE(country_custom_emoji_id, '') "
+                    "FROM services WHERE id=?",
+                    (service_id,),
+                ).fetchone()
                 num_count = conn.execute("SELECT COUNT(*) FROM numbers WHERE service_id=?", (service_id,)).fetchone()[0]
 
                 conn.execute("DELETE FROM services WHERE id = ?", (service_id,))
                 conn.commit()
 
             text = f" <b>HARD DELETE COMPLETED</b>\n\n"
-            text += f"Service: {service[0]} ({service[1]})\n"
+            country_label = service[3] or service[1]
+            text += f"Service: {service[0]} ({format_country_display(country_label, html=True, custom_emoji_id=service[4], flag_text=service[2])})\n"
             text += f"Numbers Deleted: {num_count}\n"
             text += f"Status: Permanently removed"
 
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id)
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML')
             logger.info(f"Service '{service[0]}' (ID: {service_id}) hard deleted with {num_count} numbers")
 
         except Exception as e:
@@ -1266,20 +2080,25 @@ def register_handlers(bot, get_db_connection, logger):
 
         try:
             with get_db_connection() as conn:
-                service = conn.execute("SELECT name, country FROM services WHERE id=?", (service_id,)).fetchone()
+                service = conn.execute(
+                    "SELECT name, country, COALESCE(country_flag, ''), COALESCE(country_display_name, ''), COALESCE(country_custom_emoji_id, '') "
+                    "FROM services WHERE id=?",
+                    (service_id,),
+                ).fetchone()
                 num_count = conn.execute("SELECT COUNT(*) FROM numbers WHERE service_id=?", (service_id,)).fetchone()[0]
 
                 conn.execute("UPDATE services SET status = 'inactive' WHERE id = ?", (service_id,))
                 conn.commit()
 
             text = f" <b>SOFT DELETE COMPLETED</b>\n\n"
-            text += f"Service: {service[0]} ({service[1]})\n"
+            country_label = service[3] or service[1]
+            text += f"Service: {service[0]} ({format_country_display(country_label, html=True, custom_emoji_id=service[4], flag_text=service[2])})\n"
             text += f"Numbers: {num_count} (preserved)\n"
             text += f"Status: Deactivated\n\n"
             text += f"Users can no longer get new numbers from this service,\n"
             text += f"but existing assignments remain active."
 
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id)
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML')
             logger.info(f"Service '{service[0]}' (ID: {service_id}) soft deleted - status set to inactive")
 
         except Exception as e:
@@ -1294,17 +2113,22 @@ def register_handlers(bot, get_db_connection, logger):
         
         try:
             with get_db_connection() as conn:
-                service = conn.execute("SELECT name, country FROM services WHERE id=?", (service_id,)).fetchone()
+                service = conn.execute(
+                    "SELECT name, country, COALESCE(country_flag, ''), COALESCE(country_display_name, ''), COALESCE(country_custom_emoji_id, '') "
+                    "FROM services WHERE id=?",
+                    (service_id,),
+                ).fetchone()
                 num_count = conn.execute("SELECT COUNT(*) FROM numbers WHERE service_id=?", (service_id,)).fetchone()[0]
                 
                 conn.execute("DELETE FROM services WHERE id = ?", (service_id,))
                 conn.commit()
             
             text = f" <b>Service Deleted!</b>\n\n"
-            text += f"Service: {service[0]} ({service[1]})\n"
+            country_label = service[3] or service[1]
+            text += f"Service: {service[0]} ({format_country_display(country_label, html=True, custom_emoji_id=service[4], flag_text=service[2])})\n"
             text += f"Numbers Deleted: {num_count}"
             
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id)
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML')
             logger.info(f"Service '{service[0]}' (ID: {service_id}) deleted with {num_count} numbers")
             
         except Exception as e:
@@ -1325,7 +2149,7 @@ def register_handlers(bot, get_db_connection, logger):
 
         with get_db_connection() as conn:
             service = conn.execute("""
-                SELECT s.name, s.country, COUNT(n.id) as num_count,
+                SELECT s.name, s.country, COALESCE(s.country_flag, ''), COALESCE(s.country_display_name, ''), COALESCE(s.country_custom_emoji_id, ''), COUNT(n.id) as num_count,
                        COUNT(CASE WHEN n.user_id IS NOT NULL THEN 1 END) as assigned_count
                 FROM services s
                 LEFT JOIN numbers n ON s.id = n.service_id
@@ -1333,8 +2157,7 @@ def register_handlers(bot, get_db_connection, logger):
             """, (service_id,)).fetchone()
 
         if service:
-            name, country, num_count, assigned_count = service
-            flag = get_country_flag(country)
+            name, country, country_flag, country_display_name, country_custom_emoji_id, num_count, assigned_count = service
             assigned_count = int(assigned_count) if assigned_count else 0
 
             markup = types.InlineKeyboardMarkup(row_width=2)
@@ -1342,11 +2165,12 @@ def register_handlers(bot, get_db_connection, logger):
             markup.add(types.InlineKeyboardButton(" Cancel", callback_data="cancel_reactivate"))
 
             text = f" <b>REACTIVATE SERVICE</b>\n\n"
-            text += f"Service: <b>{name}</b> ({flag} {country})\n"
+            country_label = country_display_name or country
+            text += f"Service: <b>{name}</b> ({format_country_display(country_label, html=True, custom_emoji_id=country_custom_emoji_id, flag_text=country_flag)})\n"
             text += f"Numbers: {num_count} total, {assigned_count} assigned\n\n"
             text += f"This will make the service available for new number assignments again."
 
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='HTML')
 
         answer_cbq(call)
 
@@ -1356,19 +2180,24 @@ def register_handlers(bot, get_db_connection, logger):
 
         try:
             with get_db_connection() as conn:
-                service = conn.execute("SELECT name, country FROM services WHERE id=?", (service_id,)).fetchone()
+                service = conn.execute(
+                    "SELECT name, country, COALESCE(country_flag, ''), COALESCE(country_display_name, ''), COALESCE(country_custom_emoji_id, '') "
+                    "FROM services WHERE id=?",
+                    (service_id,),
+                ).fetchone()
                 num_count = conn.execute("SELECT COUNT(*) FROM numbers WHERE service_id=?", (service_id,)).fetchone()[0]
 
                 conn.execute("UPDATE services SET status = 'active' WHERE id = ?", (service_id,))
                 conn.commit()
 
             text = f" <b>SERVICE REACTIVATED</b>\n\n"
-            text += f"Service: {service[0]} ({service[1]})\n"
+            country_label = service[3] or service[1]
+            text += f"Service: {service[0]} ({format_country_display(country_label, html=True, custom_emoji_id=service[4], flag_text=service[2])})\n"
             text += f"Numbers: {num_count}\n"
             text += f"Status: Active\n\n"
             text += f"Users can now get new numbers from this service."
 
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id)
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML')
             logger.info(f"Service '{service[0]}' (ID: {service_id}) reactivated")
 
         except Exception as e:
@@ -1466,7 +2295,7 @@ def register_handlers(bot, get_db_connection, logger):
 
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, 'Add OTP Group'))
     def add_otp_group_prompt(message):
-        msg = bot.send_message(message.chat.id, '🔗 Enter OTP Group link:\n\nExample: https://t.me/+xxxxxxxxxxxx\nOr: https://t.me/groupname\n\nType `cancel` to go back.', reply_markup=types.ReplyKeyboardRemove(), parse_mode='Markdown')
+        msg = send_prompt(message.chat.id, '🔗 Enter OTP Group link:\n\nExample: https://t.me/+xxxxxxxxxxxx\nOr: https://t.me/groupname\n\nTap Back or Cancel to go back.', parse_mode='Markdown')
         bot.register_next_step_handler(msg, process_add_otp_group)
 
     def process_add_otp_group(message):
@@ -1496,7 +2325,7 @@ def register_handlers(bot, get_db_connection, logger):
 
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, 'Change OTP Group'))
     def change_otp_group_prompt(message):
-        msg = bot.send_message(message.chat.id, '✏️ Enter new OTP Group link:\n\nType `cancel` to go back.', reply_markup=types.ReplyKeyboardRemove(), parse_mode='Markdown')
+        msg = send_prompt(message.chat.id, '✏️ Enter new OTP Group link.\n\nTap Back or Cancel to go back.', parse_mode='Markdown')
         bot.register_next_step_handler(msg, process_add_otp_group)
 
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, 'Current OTP Group'))
@@ -1525,10 +2354,9 @@ def register_handlers(bot, get_db_connection, logger):
 
     @bot.message_handler(func=lambda m: is_admin(m) and (admin_text_is(m, 'Add Target') or admin_text_is(m, 'Add Channel')))
     def add_target_prompt(message):
-        msg = bot.send_message(
+        msg = send_prompt(
             message.chat.id,
-            '🧩 Step 1/3\nEnter button name users will see.\n\nExample: Join Main Channel\n\nType `cancel` to stop.',
-            reply_markup=types.ReplyKeyboardRemove()
+            '🧩 Step 1/3\nEnter button name users will see.\n\nExample: Join Main Channel\n\nTap Back or Cancel to stop.'
         )
         bot.register_next_step_handler(msg, process_target_button_name)
 
@@ -1540,14 +2368,14 @@ def register_handlers(bot, get_db_connection, logger):
             bot.send_message(message.chat.id, '⚠️ Button name must be at least 2 characters.')
             return show_channel_settings(message)
 
-        msg = bot.send_message(
+        msg = send_prompt(
             message.chat.id,
             '🧩 Step 2/3\nEnter target identifier.\n\n'
             'Supported:\n'
             '- Numeric chat ID (e.g. -1001234567890)\n'
             '- @username\n'
             '- t.me/username (or https://t.me/username)\n\n'
-            'Type `cancel` to stop.'
+            'Tap Back or Cancel to stop.'
         )
         bot.register_next_step_handler(msg, process_target_identifier, button_name)
 
@@ -1569,14 +2397,14 @@ def register_handlers(bot, get_db_connection, logger):
             )
             return show_channel_settings(message)
 
-        msg = bot.send_message(
+        msg = send_prompt(
             message.chat.id,
             '🧩 Step 3/3\nEnter join link users will click.\n\n'
             'Supported:\n'
             '- https://t.me/...\n'
             '- t.me/...\n'
             '- @username\n\n'
-            'Type `cancel` to stop.'
+            'Tap Back or Cancel to stop.'
         )
         bot.register_next_step_handler(msg, process_target_join_link, button_name, validation)
 
@@ -1658,8 +2486,8 @@ def register_handlers(bot, get_db_connection, logger):
         text = '✏️ Select target number to edit:\n\n'
         for idx, (_, name, target, _) in enumerate(targets, 1):
             text += f'{idx}. {name} ({target})\n'
-        text += '\nType `0` or `cancel` to go back.'
-        msg = bot.send_message(message.chat.id, text, reply_markup=types.ReplyKeyboardRemove())
+        text += '\nTap Back or Cancel to go back.'
+        msg = send_prompt(message.chat.id, text, parse_mode='HTML')
         bot.register_next_step_handler(msg, process_edit_target_choice, targets)
 
     def process_edit_target_choice(message, targets):
@@ -1678,11 +2506,11 @@ def register_handlers(bot, get_db_connection, logger):
 
         target_row = targets[choice - 1]
         ch_id, name, target_identifier, invite_link = target_row
-        msg = bot.send_message(
+        msg = send_prompt(
             message.chat.id,
             f'Editing: {name}\n\n'
             f'Enter new button name (or "-" to keep current):\n'
-            f'Type `cancel` to stop.',
+            f'Tap Back or Cancel to stop.',
             parse_mode='Markdown'
         )
         bot.register_next_step_handler(msg, process_edit_target_name, ch_id, name, target_identifier, invite_link)
@@ -1696,9 +2524,9 @@ def register_handlers(bot, get_db_connection, logger):
             bot.send_message(message.chat.id, '⚠️ Invalid button name.')
             return show_channel_settings(message)
 
-        msg = bot.send_message(
+        msg = send_prompt(
             message.chat.id,
-            'Enter new target identifier (or "-" to keep current):\nType `cancel` to stop.',
+            'Enter new target identifier (or "-" to keep current):\nTap Back or Cancel to stop.',
             parse_mode='Markdown'
         )
         bot.register_next_step_handler(msg, process_edit_target_identifier, ch_id, new_name, old_target, old_link)
@@ -1728,9 +2556,9 @@ def register_handlers(bot, get_db_connection, logger):
                 return show_channel_settings(message)
             new_target = validation["resolved_identifier"] or new_target
 
-        msg = bot.send_message(
+        msg = send_prompt(
             message.chat.id,
-            'Enter new join link (or "-" to keep current):\nType `cancel` to stop.',
+            'Enter new join link (or "-" to keep current):\nTap Back or Cancel to stop.',
             parse_mode='Markdown'
         )
         bot.register_next_step_handler(msg, process_edit_target_link, ch_id, new_name, new_target, old_link)
@@ -1776,8 +2604,8 @@ def register_handlers(bot, get_db_connection, logger):
         text = '🗑️ Select target number to remove:\n\n'
         for idx, (_, name, target) in enumerate(targets, 1):
             text += f'{idx}. {name} ({target})\n'
-        text += '\nType `0` or `cancel` to go back.'
-        msg = bot.send_message(message.chat.id, text, reply_markup=types.ReplyKeyboardRemove())
+        text += '\nTap Back or Cancel to go back.'
+        msg = send_prompt(message.chat.id, text, parse_mode='HTML')
         bot.register_next_step_handler(msg, process_remove_channel, targets)
 
     def process_remove_channel(message, targets):
@@ -1812,8 +2640,8 @@ def register_handlers(bot, get_db_connection, logger):
         text = '🧪 Select target number to test:\n\n'
         for idx, (_, name, target) in enumerate(targets, 1):
             text += f'{idx}. {name} ({target})\n'
-        text += '\nType `0` or `cancel` to go back.'
-        msg = bot.send_message(message.chat.id, text, reply_markup=types.ReplyKeyboardRemove())
+        text += '\nTap Back or Cancel to go back.'
+        msg = send_prompt(message.chat.id, text, parse_mode='HTML')
         bot.register_next_step_handler(msg, process_test_target_choice, targets)
 
     def process_test_target_choice(message, targets):
@@ -1868,7 +2696,7 @@ def register_handlers(bot, get_db_connection, logger):
 
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, " Change Token"))
     def change_token_prompt(message):
-        msg = bot.send_message(message.chat.id, "✏️ Enter new bot token:\n\nType `cancel` to go back.", reply_markup=types.ReplyKeyboardRemove(), parse_mode='Markdown')
+        msg = send_prompt(message.chat.id, "✏️ Enter new bot token.\n\nTap Back or Cancel to go back.", parse_mode='Markdown')
         bot.register_next_step_handler(msg, process_change_token)
 
     def process_change_token(message):
@@ -1937,10 +2765,9 @@ def register_handlers(bot, get_db_connection, logger):
 
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, " Add Group ID"))
     def add_group_id_prompt(message):
-        msg = bot.send_message(
+        msg = send_prompt(
             message.chat.id,
-            "➕ Enter group chat ID to add.\n\nExample: -1001234567890\nType `cancel` to go back.",
-            reply_markup=types.ReplyKeyboardRemove(),
+            "➕ Enter group chat ID to add.\n\nExample: -1001234567890\nTap Back or Cancel to go back.",
             parse_mode='Markdown'
         )
         bot.register_next_step_handler(msg, process_add_group_id)
@@ -1974,8 +2801,8 @@ def register_handlers(bot, get_db_connection, logger):
             bot.send_message(message.chat.id, "ℹ️ No group IDs found.")
             return show_forwarder_panel(message)
         text = "🗑️ Enter group ID to remove:\n\n" + "\n".join(f"- <code>{gid}</code>" for gid in groups)
-        text += "\n\nType `cancel` to go back."
-        msg = bot.send_message(message.chat.id, text, parse_mode='HTML', reply_markup=types.ReplyKeyboardRemove())
+        text += "\n\nTap Back or Cancel to go back."
+        msg = send_prompt(message.chat.id, text, parse_mode='HTML')
         bot.register_next_step_handler(msg, process_remove_group_id)
 
     def process_remove_group_id(message):
@@ -2003,10 +2830,9 @@ def register_handlers(bot, get_db_connection, logger):
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, " Set Number Bot Link"))
     def set_number_bot_link_prompt(message):
         current = get_bot_config_value("forwarder_number_bot_link", "")
-        msg = bot.send_message(
+        msg = send_prompt(
             message.chat.id,
-            f"🔗 Enter Number Bot link.\n\nCurrent: {current or 'Not set'}\n\nType `cancel` to go back.",
-            reply_markup=types.ReplyKeyboardRemove()
+            f"🔗 Enter Number Bot link.\n\nCurrent: {current or 'Not set'}\n\nTap Back or Cancel to go back."
         )
         bot.register_next_step_handler(msg, process_set_number_bot_link)
 
@@ -2038,10 +2864,9 @@ def register_handlers(bot, get_db_connection, logger):
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, " Set Support Group Link"))
     def set_support_group_link_prompt(message):
         current = get_bot_config_value("forwarder_support_group_link", "")
-        msg = bot.send_message(
+        msg = send_prompt(
             message.chat.id,
-            f"🔗 Enter Support Group link.\n\nCurrent: {current or 'Not set'}\n\nType `cancel` to go back.",
-            reply_markup=types.ReplyKeyboardRemove()
+            f"🔗 Enter Support Group link.\n\nCurrent: {current or 'Not set'}\n\nTap Back or Cancel to go back."
         )
         bot.register_next_step_handler(msg, process_set_support_group_link)
 
@@ -2089,10 +2914,9 @@ def register_handlers(bot, get_db_connection, logger):
 
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, " Change Forwarder Token"))
     def change_forwarder_token_prompt(message):
-        msg = bot.send_message(
+        msg = send_prompt(
             message.chat.id,
-            "✏️ Enter new forwarder bot token:\n\nType `cancel` to go back.",
-            reply_markup=types.ReplyKeyboardRemove(),
+            "✏️ Enter new forwarder bot token.\n\nTap Back or Cancel to go back.",
             parse_mode='Markdown'
         )
         bot.register_next_step_handler(msg, process_change_forwarder_token)
@@ -2147,7 +2971,7 @@ def register_handlers(bot, get_db_connection, logger):
 
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, " Change Name"))
     def change_name_prompt(message):
-        msg = bot.send_message(message.chat.id, "✏️ Enter new bot name:\n\nType `cancel` to go back.", reply_markup=types.ReplyKeyboardRemove(), parse_mode='Markdown')
+        msg = send_prompt(message.chat.id, "✏️ Enter new bot name.\n\nTap Back or Cancel to go back.", parse_mode='Markdown')
         bot.register_next_step_handler(msg, process_change_bot_name)
 
     def process_change_bot_name(message):
@@ -2229,7 +3053,7 @@ def register_handlers(bot, get_db_connection, logger):
 
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, " Add Admin"))
     def add_admin_prompt(message):
-        msg = bot.send_message(message.chat.id, "➕ Enter user ID to add as admin:\n\nType `cancel` to go back.", reply_markup=types.ReplyKeyboardRemove(), parse_mode='Markdown')
+        msg = send_prompt(message.chat.id, "➕ Enter user ID to add as admin.\n\nTap Back or Cancel to go back.", parse_mode='Markdown')
         bot.register_next_step_handler(msg, process_add_admin)
 
     def process_add_admin(message):
@@ -2266,7 +3090,7 @@ def register_handlers(bot, get_db_connection, logger):
 
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, " Remove Admin"))
     def remove_admin_prompt(message):
-        msg = bot.send_message(message.chat.id, "🗑️ Enter user ID to remove from admins:\n\nType `cancel` to go back.", reply_markup=types.ReplyKeyboardRemove(), parse_mode='Markdown')
+        msg = send_prompt(message.chat.id, "🗑️ Enter user ID to remove from admins.\n\nTap Back or Cancel to go back.", parse_mode='Markdown')
         bot.register_next_step_handler(msg, process_remove_admin)
 
     def process_remove_admin(message):
@@ -2317,7 +3141,7 @@ def register_handlers(bot, get_db_connection, logger):
 
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, " Change Limit"))
     def change_numbers_limit_prompt(message):
-        msg = bot.send_message(message.chat.id, "✏️ Enter new numbers limit:\n\nExample: 5, 10, 15\n(Minimum: 1, Maximum: 20)\n\nType `cancel` to go back.", reply_markup=types.ReplyKeyboardRemove(), parse_mode='Markdown')
+        msg = send_prompt(message.chat.id, "✏️ Enter new numbers limit:\n\nExample: 5, 10, 15\n(Minimum: 1, Maximum: 20)\n\nTap Back or Cancel to go back.", parse_mode='Markdown')
         bot.register_next_step_handler(msg, process_change_numbers_limit)
 
     def process_change_numbers_limit(message):
@@ -2366,7 +3190,7 @@ def register_handlers(bot, get_db_connection, logger):
 
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, " Change Cooldown"))
     def change_cooldown_prompt(message):
-        msg = bot.send_message(message.chat.id, "✏️ Enter new cooldown seconds:\n\nExample: 7, 30, 60\n\nType `cancel` to go back.", reply_markup=types.ReplyKeyboardRemove(), parse_mode='Markdown')
+        msg = send_prompt(message.chat.id, "✏️ Enter new cooldown seconds:\n\nExample: 7, 30, 60\n\nTap Back or Cancel to go back.", parse_mode='Markdown')
         bot.register_next_step_handler(msg, process_change_cooldown)
 
     def process_change_cooldown(message):
@@ -2416,7 +3240,7 @@ def register_handlers(bot, get_db_connection, logger):
 
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, " Change SMS Limit"))
     def change_sms_limit_prompt(message):
-        msg = bot.send_message(message.chat.id, "✏️ Enter SMS limit (0, 1, 2, 3...):\n\nType `cancel` to go back.", reply_markup=types.ReplyKeyboardRemove(), parse_mode='Markdown')
+        msg = send_prompt(message.chat.id, "✏️ Enter SMS limit (0, 1, 2, 3...):\n\nTap Back or Cancel to go back.", parse_mode='Markdown')
         bot.register_next_step_handler(msg, process_change_sms_limit)
 
     def process_change_sms_limit(message):
@@ -2483,13 +3307,12 @@ def register_handlers(bot, get_db_connection, logger):
 
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, " Change Sub Hours"))
     def change_sub_check_hours_prompt(message):
-        msg = bot.send_message(
+        msg = send_prompt(
             message.chat.id,
             "✏️ Enter subscription recheck hours:\n\n"
             "Examples: 0, 1, 6, 12, 24\n"
             "Use 0 = check every request.\n\n"
-            "Type `cancel` to go back.",
-            reply_markup=types.ReplyKeyboardRemove(),
+            "Tap Back or Cancel to go back.",
             parse_mode='Markdown'
         )
         bot.register_next_step_handler(msg, process_change_sub_check_hours)
@@ -2586,10 +3409,9 @@ def register_handlers(bot, get_db_connection, logger):
 
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, " Set Timer Min"))
     def prompt_set_reservation_minutes(message):
-        msg = bot.send_message(
+        msg = send_prompt(
             message.chat.id,
-            "✏️ Enter reservation timer in minutes (1-1440).\n\nType `cancel` to go back.",
-            reply_markup=types.ReplyKeyboardRemove(),
+            "✏️ Enter reservation timer in minutes (1-1440).\n\nTap Back or Cancel to go back.",
             parse_mode='Markdown'
         )
         bot.register_next_step_handler(msg, process_set_reservation_minutes)
@@ -2614,10 +3436,9 @@ def register_handlers(bot, get_db_connection, logger):
 
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, " Set Check Interval"))
     def prompt_set_auto_release_interval(message):
-        msg = bot.send_message(
+        msg = send_prompt(
             message.chat.id,
-            "✏️ Enter auto-release check interval in seconds (5-3600).\n\nType `cancel` to go back.",
-            reply_markup=types.ReplyKeyboardRemove(),
+            "✏️ Enter auto-release check interval in seconds (5-3600).\n\nTap Back or Cancel to go back.",
             parse_mode='Markdown'
         )
         bot.register_next_step_handler(msg, process_set_auto_release_interval)
@@ -2691,8 +3512,6 @@ def register_handlers(bot, get_db_connection, logger):
             bot.send_message(message.chat.id, f"❌ Queue rebuild failed: {e}")
         show_queue_timer_menu(message)
 
-
-
     # ==================== USER MANAGEMENT ====================
     def show_user_management(message):
         markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
@@ -2705,7 +3524,7 @@ def register_handlers(bot, get_db_connection, logger):
 
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, "Ban User"))
     def ban_user_prompt(message):
-        msg = bot.send_message(message.chat.id, "⛔ Enter user ID to ban:\n\nType `cancel` to go back.", reply_markup=types.ReplyKeyboardRemove(), parse_mode='Markdown')
+        msg = send_prompt(message.chat.id, "⛔ Enter user ID to ban.\n\nTap Back or Cancel to go back.", parse_mode='Markdown')
         bot.register_next_step_handler(msg, process_ban_user)
 
     def process_ban_user(message):
@@ -2713,7 +3532,7 @@ def register_handlers(bot, get_db_connection, logger):
         if is_cancel_text(raw):
             return show_user_management(message)
         if not raw:
-            msg = bot.send_message(message.chat.id, "⚠️ Enter user ID to ban (numbers only):", reply_markup=types.ReplyKeyboardRemove())
+            msg = bot.send_message(message.chat.id, "⚠️ Enter user ID to ban (numbers only):", reply_markup=build_prompt_nav_keyboard())
             bot.register_next_step_handler(msg, process_ban_user)
             return
         try:
@@ -2730,7 +3549,8 @@ def register_handlers(bot, get_db_connection, logger):
         try:
             with get_db_connection() as conn:
                 conn.execute(
-                    "INSERT OR REPLACE INTO banned_users (user_id, reason) VALUES (?, ?)",
+                    "INSERT INTO banned_users (user_id, reason, banned_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
+                    "ON CONFLICT(user_id) DO UPDATE SET reason=excluded.reason, banned_at=CURRENT_TIMESTAMP",
                     (user_id, "Manual ban")
                 )
                 conn.commit()
@@ -2743,7 +3563,7 @@ def register_handlers(bot, get_db_connection, logger):
 
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, "Unban User"))
     def unban_user_prompt(message):
-        msg = bot.send_message(message.chat.id, "✅ Enter user ID to unban:\n\nType `cancel` to go back.", reply_markup=types.ReplyKeyboardRemove(), parse_mode='Markdown')
+        msg = send_prompt(message.chat.id, "✅ Enter user ID to unban.\n\nTap Back or Cancel to go back.", parse_mode='Markdown')
         bot.register_next_step_handler(msg, process_unban_user)
 
     def process_unban_user(message):
@@ -2751,7 +3571,7 @@ def register_handlers(bot, get_db_connection, logger):
         if is_cancel_text(raw):
             return show_user_management(message)
         if not raw:
-            msg = bot.send_message(message.chat.id, "⚠️ Enter user ID to unban (numbers only):", reply_markup=types.ReplyKeyboardRemove())
+            msg = bot.send_message(message.chat.id, "⚠️ Enter user ID to unban (numbers only):", reply_markup=build_prompt_nav_keyboard())
             bot.register_next_step_handler(msg, process_unban_user)
             return
         try:
@@ -2933,28 +3753,39 @@ def register_handlers(bot, get_db_connection, logger):
     @bot.message_handler(func=lambda m: is_admin(m) and admin_text_is(m, " DB Size & Info"))
     def show_db_size_info(message):
         import os
-        db_path = "number_panel.db"
-        
-        if os.path.exists(db_path):
-            db_size = os.path.getsize(db_path) / (1024 * 1024)  # Convert to MB
-            
-            with get_db_connection() as conn:
-                c = conn.cursor()
-                
-                # Get table info
-                tables = c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-                
+
+        with get_db_connection() as conn:
+            c = conn.cursor()
+            if DB_ENGINE == "postgresql":
+                db_size = c.execute("SELECT pg_database_size(current_database())").fetchone()[0] / (1024 * 1024)
+                tables = c.execute(
+                    "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
+                ).fetchall()
                 text = f" <b>Database Information</b>\n\n"
-                text += f" <b>File Size:</b> {db_size:.2f} MB\n"
+                text += " <b>Engine:</b> PostgreSQL\n"
+                text += f" <b>Database Size:</b> {db_size:.2f} MB\n"
                 text += f" <b>Tables:</b> {len(tables)}\n\n"
-                
                 text += "<b>Table Details:</b>\n"
                 for table in tables:
                     table_name = table[0]
                     row_count = c.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
                     text += f"   {table_name}: {row_count} rows\n"
-        else:
-            text = " Database file not found!"
+            else:
+                db_path = DB_NAME
+                if os.path.exists(db_path):
+                    db_size = os.path.getsize(db_path) / (1024 * 1024)
+                    tables = c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                    text = f" <b>Database Information</b>\n\n"
+                    text += " <b>Engine:</b> SQLite\n"
+                    text += f" <b>File Size:</b> {db_size:.2f} MB\n"
+                    text += f" <b>Tables:</b> {len(tables)}\n\n"
+                    text += "<b>Table Details:</b>\n"
+                    for table in tables:
+                        table_name = table[0]
+                        row_count = c.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+                        text += f"   {table_name}: {row_count} rows\n"
+                else:
+                    text = " Database file not found!"
         
         bot.send_message(message.chat.id, text, reply_markup=types.ReplyKeyboardRemove())
         show_database_management(message)
@@ -3000,11 +3831,19 @@ def register_handlers(bot, get_db_connection, logger):
         try:
             with get_db_connection() as conn:
                 c = conn.cursor()
-                c.execute("VACUUM")
-                conn.commit()
+                if DB_ENGINE == "postgresql":
+                    conn.commit()
+                    conn.autocommit = True
+                    c = conn.cursor()
+                    c.execute("VACUUM ANALYZE")
+                    conn.autocommit = False
+                else:
+                    c.execute("VACUUM")
+                    conn.commit()
             
             logger.info(f"Database optimized by admin {message.from_user.id}")
-            bot.send_message(message.chat.id, " <b>Database Optimized</b>\n\n VACUUM operation completed successfully!", reply_markup=types.ReplyKeyboardRemove())
+            label = "VACUUM ANALYZE" if DB_ENGINE == "postgresql" else "VACUUM"
+            bot.send_message(message.chat.id, f" <b>Database Optimized</b>\n\n {label} completed successfully!", reply_markup=types.ReplyKeyboardRemove())
         except Exception as e:
             logger.error(f"Database optimization error: {e}")
             bot.send_message(message.chat.id, f" Optimization failed: {e}", reply_markup=types.ReplyKeyboardRemove())
@@ -3191,12 +4030,17 @@ def register_handlers(bot, get_db_connection, logger):
             import time
             
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_file = f"backups/export_db_{timestamp}.db"
-            
-            shutil.copy("number_panel.db", backup_file)
-            logger.info(f"Database exported by admin {message.from_user.id}")
-            
-            bot.send_message(message.chat.id, f" <b>Export Complete</b>\n\n Database exported to:\n<code>{backup_file}</code>", reply_markup=types.ReplyKeyboardRemove())
+            if DB_ENGINE == "postgresql":
+                bot.send_message(
+                    message.chat.id,
+                    " PostgreSQL export is not a file copy anymore.\nUse `pg_dump` for a full database backup.",
+                    reply_markup=types.ReplyKeyboardRemove(),
+                )
+            else:
+                backup_file = f"backups/export_db_{timestamp}.db"
+                shutil.copy(DB_NAME, backup_file)
+                logger.info(f"Database exported by admin {message.from_user.id}")
+                bot.send_message(message.chat.id, f" <b>Export Complete</b>\n\n Database exported to:\n<code>{backup_file}</code>", reply_markup=types.ReplyKeyboardRemove())
         except Exception as e:
             bot.send_message(message.chat.id, f" Export failed: {e}", reply_markup=types.ReplyKeyboardRemove())
         
@@ -3278,7 +4122,10 @@ def register_handlers(bot, get_db_connection, logger):
                 
                 # Database size
                 import os
-                db_size = os.path.getsize("number_panel.db") / (1024 * 1024)
+                if DB_ENGINE == "postgresql":
+                    db_size = c.execute("SELECT pg_database_size(current_database())").fetchone()[0] / (1024 * 1024)
+                else:
+                    db_size = os.path.getsize(DB_NAME) / (1024 * 1024)
                 if db_size > 100:
                     text += f" <b>Large DB:</b> Database is {db_size:.2f} MB\n"
                 else:
@@ -3362,36 +4209,82 @@ def register_handlers(bot, get_db_connection, logger):
         ask_service_name_for_add(call.message, edit_msg_id=call.message.message_id)
         answer_cbq(call)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "add_new_service")
+    @bot.callback_query_handler(func=lambda call: call.data == "create_new_service")
     def handle_add_new_service(call):
-        msg = bot.send_message(call.message.chat.id, " Enter new Country Name:")
-        bot.register_next_step_handler(msg, create_new_service_flow)
+        msg = send_prompt(call.message.chat.id, " Enter flag / emoji / premium emoji first.\n\nExample: 🇩🇪", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, create_new_service_flag_step)
         answer_cbq(call)
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("create_service_"))
     def handle_create_service(call):
         country = call.data.replace("create_service_", "")
         msg = bot.send_message(call.message.chat.id, f" Enter Service Name for {country} (you can include emojis):")
-        bot.register_next_step_handler(msg, finish_new_service, country)
+        bot.register_next_step_handler(msg, finish_new_service, make_country_meta(display_name=country))
         answer_cbq(call)
 
-    def create_new_service_flow(message):
-        country = message.text.strip()
-        if not country:
-            bot.send_message(message.chat.id, " Country name cannot be empty.")
+    def create_new_service_flag_step(message):
+        raw = (message.text or "").strip()
+        if is_cancel_text(raw):
             return ask_service_name_for_add(message)
-        
-        msg = bot.send_message(message.chat.id, f" Enter Service Name for {country} (you can include emojis):")
-        bot.register_next_step_handler(msg, finish_new_service, country)
+        if not raw:
+            bot.send_message(message.chat.id, " Flag cannot be empty.")
+            return ask_service_name_for_add(message)
+        flag_text, country_custom_emoji_id = parse_service_emoji_input(message)
+        flag_text = normalize_custom_emoji_text(flag_text)
+        if country_custom_emoji_id and not flag_text and is_raw_custom_emoji_id_input(message):
+            msg = send_skip_prompt(
+                message.chat.id,
+                " Send visible token for this country custom emoji.\n\nExamples:\n🇱🇷\n🇴🇲\n💬\n\nDirect premium emoji does not need this step.\nTap Skip to keep token empty.",
+                parse_mode='Markdown',
+            )
+            bot.register_next_step_handler(msg, create_new_service_flag_token_step, country_custom_emoji_id)
+            return
+        msg = send_prompt(message.chat.id, " Enter country short code.\n\nExample: DE", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, create_new_service_code_step, flag_text, country_custom_emoji_id)
 
-    def finish_new_service(message, country):
+    def create_new_service_flag_token_step(message, country_custom_emoji_id=""):
+        raw = (message.text or "").strip()
+        if is_cancel_text(raw):
+            return ask_service_name_for_add(message)
+        flag_text = ""
+        if not is_skip_text(raw):
+            flag_text = normalize_custom_emoji_text(raw)
+        msg = send_prompt(message.chat.id, " Enter country short code.\n\nExample: DE", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, create_new_service_code_step, flag_text, country_custom_emoji_id)
+
+    def create_new_service_code_step(message, flag_text, country_custom_emoji_id=""):
+        country_code = normalize_country_code_value(message.text)
+        if is_cancel_text(message.text):
+            return ask_service_name_for_add(message)
+        if not country_code:
+            bot.send_message(message.chat.id, " Country short code cannot be empty.")
+            return ask_service_name_for_add(message)
+        msg = send_prompt(message.chat.id, " Enter country display name.\n\nExample: Germany", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, create_new_service_label_step, flag_text, country_code, country_custom_emoji_id)
+
+    def create_new_service_label_step(message, flag_text, country_code, country_custom_emoji_id=""):
+        country_label = (message.text or "").strip()
+        if is_cancel_text(country_label):
+            return ask_service_name_for_add(message)
+        if not country_label:
+            bot.send_message(message.chat.id, " Country display name cannot be empty.")
+            return ask_service_name_for_add(message)
+        country_info = make_country_meta(flag_text, country_code, country_label, custom_emoji_id=country_custom_emoji_id)
+        country = country_info.get("display_name") or country_info.get("display_country") or "Unknown"
+        msg = send_prompt(message.chat.id, f" Enter Service Name for {country} (you can include emojis):", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, finish_new_service, country_info)
+
+    def finish_new_service(message, country_info):
         service_name = message.text.strip()
+        if is_cancel_text(service_name):
+            return ask_service_name_for_add(message)
         if not service_name:
             bot.send_message(message.chat.id, "⚠️ Service name cannot be empty.")
             return ask_service_name_for_add(message)
         
+        country = (country_info or {}).get("display_name") or (country_info or {}).get("display_country") or "Unknown"
         msg = bot.send_message(message.chat.id, f" Send {country} for {service_name}:", reply_markup=types.ReplyKeyboardRemove())
-        bot.register_next_step_handler(msg, process_and_save_numbers, country, service_name, None)
+        bot.register_next_step_handler(msg, process_and_save_numbers, country_info, service_name, None)
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("add_service_"))
     def handle_add_service(call):
@@ -3410,30 +4303,29 @@ def register_handlers(bot, get_db_connection, logger):
         admin_panel(call.message)
         answer_cbq(call)
 
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("add_service_"))
-    def handle_add_service(call):
-        service_name = call.data.replace("add_service_", "")
-        ask_country_for_service(call.message, service_name, edit_msg_id=call.message.message_id)
-        answer_cbq(call)
-
     @bot.callback_query_handler(func=lambda call: call.data.startswith("add_to_country_"))
     def handle_add_to_country(call):
         service_id = int(call.data.replace("add_to_country_", ""))
         
         with get_db_connection() as conn:
-            service = conn.execute("SELECT name, country FROM services WHERE id=?", (service_id,)).fetchone()
+            service = conn.execute(
+                "SELECT name, country, COALESCE(country_flag, ''), COALESCE(country_custom_emoji_id, ''), COALESCE(country_code, ''), "
+                "COALESCE(country_display_name, '') FROM services WHERE id=?",
+                (service_id,),
+            ).fetchone()
         
         if service:
-            service_name, country = service
-            ask_for_numbers_file(call.message, country, service_name, service_id)
+            service_name, country, flag_text, country_custom_emoji_id, country_code, display_name = service
+            country_info = make_country_meta(flag_text, country_code, display_name or country, custom_emoji_id=country_custom_emoji_id)
+            ask_for_numbers_file(call.message, country_info, service_name, service_id)
         
         answer_cbq(call)
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("add_new_country_"))
     def handle_add_new_country(call):
         service_name = call.data.replace("add_new_country_", "")
-        msg = bot.send_message(call.message.chat.id, f" Enter Country Name for {service_name}:")
-        bot.register_next_step_handler(msg, create_country_and_add_numbers, service_name)
+        msg = send_prompt(call.message.chat.id, f" Enter flag / emoji / premium emoji for {service_name}.\n\nExample: 🇩🇪", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, create_country_flag_step, service_name)
         answer_cbq(call)
 
     @bot.callback_query_handler(func=lambda call: call.data == "back_to_services")
@@ -3441,19 +4333,58 @@ def register_handlers(bot, get_db_connection, logger):
         ask_service_name_for_add(call.message, edit_msg_id=call.message.message_id)
         answer_cbq(call)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "create_new_service")
-    def handle_create_new_service(call):
-        ask_service_name_for_new(call.message)
-        answer_cbq(call)
-
-    def create_country_and_add_numbers(message, service_name):
-        country_name = message.text.strip()
-        if not country_name:
-            bot.send_message(message.chat.id, " Country name cannot be empty.")
-            msg = bot.send_message(message.chat.id, f" Enter Country Name for {service_name}:")
-            bot.register_next_step_handler(msg, create_country_and_add_numbers, service_name)
+    def create_country_flag_step(message, service_name):
+        raw = (message.text or "").strip()
+        if is_cancel_text(raw):
+            return ask_country_for_service(message, service_name)
+        if not raw:
+            bot.send_message(message.chat.id, " Flag cannot be empty.")
+            msg = send_prompt(message.chat.id, f" Enter flag / emoji / premium emoji for {service_name}.", parse_mode='Markdown')
+            bot.register_next_step_handler(msg, create_country_flag_step, service_name)
             return
-        
-        # Do not create DB row yet; process_and_save_numbers will auto-detect country from numbers
-        # and then insert/update the correct service-country record.
-        ask_for_numbers_file(message, country_name, service_name, None)
+        flag_text, country_custom_emoji_id = parse_service_emoji_input(message)
+        flag_text = normalize_custom_emoji_text(flag_text)
+        if country_custom_emoji_id and not flag_text and is_raw_custom_emoji_id_input(message):
+            msg = send_skip_prompt(
+                message.chat.id,
+                f" Send visible token for {service_name} country icon.\n\nExamples:\n🇱🇷\n🇴🇲\n💬\n\nDirect premium emoji does not need this step.\nTap Skip to keep token empty.",
+                parse_mode='Markdown',
+            )
+            bot.register_next_step_handler(msg, create_country_flag_token_step, service_name, country_custom_emoji_id)
+            return
+        msg = send_prompt(message.chat.id, f" Enter country short code for {service_name}.\n\nExample: BD", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, create_country_code_step, service_name, flag_text, country_custom_emoji_id)
+
+    def create_country_flag_token_step(message, service_name, country_custom_emoji_id=""):
+        raw = (message.text or "").strip()
+        if is_cancel_text(raw):
+            return ask_country_for_service(message, service_name)
+        flag_text = ""
+        if not is_skip_text(raw):
+            flag_text = normalize_custom_emoji_text(raw)
+        msg = send_prompt(message.chat.id, f" Enter country short code for {service_name}.\n\nExample: BD", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, create_country_code_step, service_name, flag_text, country_custom_emoji_id)
+
+    def create_country_code_step(message, service_name, flag_text, country_custom_emoji_id=""):
+        country_code = normalize_country_code_value(message.text)
+        if is_cancel_text(message.text):
+            return ask_country_for_service(message, service_name)
+        if not country_code:
+            bot.send_message(message.chat.id, " Country short code cannot be empty.")
+            msg = send_prompt(message.chat.id, f" Enter country short code for {service_name}.\n\nExample: BD", parse_mode='Markdown')
+            bot.register_next_step_handler(msg, create_country_code_step, service_name, flag_text, country_custom_emoji_id)
+            return
+        msg = send_prompt(message.chat.id, f" Enter country display name for {service_name}.\n\nExample: Bangladesh", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, create_country_and_add_numbers, service_name, flag_text, country_code, country_custom_emoji_id)
+
+    def create_country_and_add_numbers(message, service_name, flag_text, country_code, country_custom_emoji_id=""):
+        country_label = (message.text or "").strip()
+        if is_cancel_text(country_label):
+            return ask_country_for_service(message, service_name)
+        if not country_label:
+            bot.send_message(message.chat.id, " Country display name cannot be empty.")
+            msg = send_prompt(message.chat.id, f" Enter country display name for {service_name}.", parse_mode='Markdown')
+            bot.register_next_step_handler(msg, create_country_and_add_numbers, service_name, flag_text, country_code, country_custom_emoji_id)
+            return
+        country_info = make_country_meta(flag_text, country_code, country_label, custom_emoji_id=country_custom_emoji_id)
+        ask_for_numbers_file(message, country_info, service_name, None)

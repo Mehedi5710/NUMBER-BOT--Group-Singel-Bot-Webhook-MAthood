@@ -65,16 +65,17 @@ if __name__ == "__main__":
     print("⌨️ Press Ctrl+C to stop...")
 
     try:
-        # Start bot command polling (this was crashing before)
-        bot.infinity_polling(timeout=30, long_polling_timeout=20)
+        # Keep polling alive across transient Telegram/network failures.
+        retry_delay = 5
+        while True:
+            try:
+                bot.infinity_polling(timeout=30, long_polling_timeout=20)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                logger.error(f"Bot polling error: {e}")
+                print(f"Bot polling error: {e}")
+                print(f"Retrying polling in {retry_delay} seconds...")
+                time.sleep(retry_delay)
     except KeyboardInterrupt:
         print("\nBot stopped by user")
-    except Exception as e:
-        print(f"Bot polling error: {e}")
-        print("Continuing with webhook only...")
-        # Keep the process alive  webhook
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            print("\nBot stopped by user")

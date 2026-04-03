@@ -2,6 +2,7 @@
 import difflib
 import re
 from country import COUNTRIES
+from custom_emoji import normalize_custom_emoji_text, render_custom_emoji_text
 
 # Build flag dictionary from country data
 FLAG_MAP = {}
@@ -10,6 +11,33 @@ for country in COUNTRIES:
     flag = country.get('flag')
     if name and flag:
         FLAG_MAP[name] = flag
+
+
+def extract_display_flag(country_text):
+    """Return the leading emoji/custom display token if the text starts with one."""
+    raw = normalize_custom_emoji_text(country_text)
+    raw = str(raw or "").strip()
+    if not raw:
+        return ""
+    token_match = re.match(r"(\[\[ce:\d{10,40}\]\])(?:\s+|$)", raw)
+    if token_match:
+        return token_match.group(1)
+    first = raw.split(maxsplit=1)[0].strip()
+    if not first:
+        return ""
+    if re.search(r"[A-Za-z0-9]", first):
+        return ""
+    return first
+
+
+def strip_display_flag(country_text):
+    """Remove the leading display flag token from a country label."""
+    raw = normalize_custom_emoji_text(country_text)
+    raw = str(raw or "").strip()
+    token = extract_display_flag(raw)
+    if token and raw.startswith(token):
+        return raw[len(token):].strip()
+    return raw
 
 
 def _norm(text):
@@ -181,21 +209,7 @@ def detect_country_from_numbers(numbers, country_hint=None):
     return resolve_country(country_hint)
 
 
-def get_flag(country_name):
-    """Get flag emoji for a country name
-    
-    Args:
-        country_name (str): Country name (e.g., "Bangladesh", "Romania")
-    
-    Returns:
-        str: Flag emoji or "🌍" if not found
-    
-    Example:
-        >>> get_flag("Bangladesh")
-        '🇧🇩'
-        >>> get_flag("Unknown")
-        '🌍'
-    """
+def _legacy_get_flag(country_name):
     if not country_name:
         return "🌍"
 
@@ -212,8 +226,112 @@ def get_flag(country_name):
     return "🌍"
 
 
+def get_flag(country_name):
+    """Get flag emoji for a country name
+    
+    Args:
+        country_name (str): Country name (e.g., "Bangladesh", "Romania")
+    
+    Returns:
+        str: Flag emoji or "🌍" if not found
+    
+    Example:
+        >>> get_flag("Bangladesh")
+        '🇧🇩'
+        >>> get_flag("Unknown")
+        '🌍'
+    """
+    raw = normalize_custom_emoji_text(country_name)
+    raw = str(raw or "").strip()
+    if not raw:
+        return "🌍"
+    custom = extract_display_flag(raw)
+    if custom:
+        return render_custom_emoji_text(custom, html=False) or "🌍"
+    return _legacy_get_flag(raw)
+
+
+def normalize_country_code(country_code):
+    raw = str(country_code or "").strip().upper()
+    raw = re.sub(r"[^A-Z0-9]+", "", raw)
+    return raw
+
+
+def build_country_display(flag_text="", display_name="", custom_emoji_id=""):
+    flag_text = normalize_custom_emoji_text(flag_text)
+    flag_text = str(flag_text or "").strip()
+    custom_emoji_id = str(custom_emoji_id or "").strip()
+    display_name = str(display_name or "").strip()
+    if custom_emoji_id:
+        token = f"[[ce:{custom_emoji_id}]]"
+        if display_name:
+            return f"{token} {display_name}".strip()
+        return token
+    if flag_text and display_name:
+        return f"{flag_text} {display_name}".strip()
+    return flag_text or display_name or "Unknown"
+
+
+def format_display_country(country_name, html=False, custom_emoji_id="", flag_text=""):
+    """Return a user-facing country label using only stored/admin-provided flag sources."""
+    raw = normalize_custom_emoji_text(country_name)
+    raw = str(raw or "").strip()
+    flag_text = normalize_custom_emoji_text(flag_text)
+    flag_text = str(flag_text or "").strip()
+    custom_emoji_id = str(custom_emoji_id or "").strip()
+    if not raw and not flag_text and not custom_emoji_id:
+        return ""
+    label = strip_display_flag(raw) if raw else ""
+    explicit_flag = flag_text or extract_display_flag(raw)
+    if custom_emoji_id:
+        custom_rendered = render_custom_emoji_text(
+            f"[[ce:{custom_emoji_id}]]",
+            html=html,
+            plain_fallback=explicit_flag,
+        )
+        if label:
+            return f"{custom_rendered} {label}".strip() if custom_rendered else label
+        return custom_rendered or explicit_flag or ""
+    if explicit_flag:
+        rendered_flag = render_custom_emoji_text(explicit_flag, html=html, plain_fallback=explicit_flag)
+        if label:
+            return f"{rendered_flag} {label}".strip() if rendered_flag else label
+        return rendered_flag or explicit_flag or ""
+    rendered = render_custom_emoji_text(raw, html=html)
+    return rendered or raw or ""
+
+
+def format_display_country_visible(country_name, flag_text="", custom_emoji_id=""):
+    raw = normalize_custom_emoji_text(country_name)
+    raw = str(raw or "").strip()
+    flag_text = normalize_custom_emoji_text(flag_text)
+    flag_text = str(flag_text or "").strip()
+    custom_emoji_id = str(custom_emoji_id or "").strip()
+    if not raw and not flag_text and not custom_emoji_id:
+        return ""
+    return format_display_country(raw, html=False, custom_emoji_id=custom_emoji_id, flag_text=flag_text)
+
+
+def format_country_icon(flag_text="", custom_emoji_id="", html=False):
+    flag_text = normalize_custom_emoji_text(flag_text)
+    flag_text = str(flag_text or "").strip()
+    custom_emoji_id = str(custom_emoji_id or "").strip()
+    if custom_emoji_id:
+        return render_custom_emoji_text(
+            f"[[ce:{custom_emoji_id}]]",
+            html=html,
+            plain_fallback=flag_text,
+        ).strip() or flag_text or ""
+    if flag_text:
+        return render_custom_emoji_text(flag_text, html=html, plain_fallback=flag_text).strip() or flag_text
+    return ""
+
+
 def canonical_country_name(country_hint, numbers=None):
     """Return best canonical country name from hint + optional number list."""
+    stripped = strip_display_flag(country_hint)
+    if stripped and stripped != str(country_hint or "").strip():
+        return stripped
     if numbers:
         detected = detect_country_from_numbers(numbers, country_hint=country_hint)
         if detected and detected.get("name"):
