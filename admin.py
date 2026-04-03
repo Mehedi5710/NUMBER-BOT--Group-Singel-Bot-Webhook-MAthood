@@ -1344,21 +1344,18 @@ def register_handlers(bot, get_db_connection, logger):
 
         with get_db_connection() as conn:
             c = conn.cursor()
-            
-            # Get or create service using short code when available; country text is display-only.
-            if country_code:
+
+            if service_id is None:
+                # Keep display names distinct even when short code / flag are the same.
                 c.execute(
-                    "SELECT id FROM services WHERE UPPER(TRIM(COALESCE(country_code, ''))) = UPPER(TRIM(?)) "
-                    "AND UPPER(TRIM(name)) = UPPER(TRIM(?))",
-                    (country_code, service_name),
+                    "SELECT id FROM services "
+                    "WHERE UPPER(TRIM(name)) = UPPER(TRIM(?)) "
+                    "AND UPPER(TRIM(COALESCE(country_display_name, country, ''))) = UPPER(TRIM(?))",
+                    (service_name, country_display_name),
                 )
+                service = c.fetchone()
             else:
-                c.execute(
-                    "SELECT id FROM services WHERE UPPER(TRIM(country)) = UPPER(TRIM(?)) "
-                    "AND UPPER(TRIM(name)) = UPPER(TRIM(?))",
-                    (country_name, service_name),
-                )
-            service = c.fetchone()
+                service = (service_id,)
 
             if service:
                 service_id = service[0]
@@ -1378,18 +1375,12 @@ def register_handlers(bot, get_db_connection, logger):
                     (service_name, country_name, country_flag, country_custom_emoji_id, country_code, country_display_name, button_emoji, service_emoji, custom_emoji_id),
                 )
                 conn.commit()
-                if country_code:
-                    service_id = c.execute(
-                        "SELECT id FROM services WHERE UPPER(TRIM(COALESCE(country_code, ''))) = UPPER(TRIM(?)) "
-                        "AND UPPER(TRIM(name)) = UPPER(TRIM(?))",
-                        (country_code, service_name),
-                    ).fetchone()[0]
-                else:
-                    service_id = c.execute(
-                        "SELECT id FROM services WHERE UPPER(TRIM(country)) = UPPER(TRIM(?)) "
-                        "AND UPPER(TRIM(name)) = UPPER(TRIM(?))",
-                        (country_name, service_name),
-                    ).fetchone()[0]
+                service_id = c.execute(
+                    "SELECT id FROM services "
+                    "WHERE UPPER(TRIM(name)) = UPPER(TRIM(?)) "
+                    "AND UPPER(TRIM(COALESCE(country_display_name, country, ''))) = UPPER(TRIM(?))",
+                    (service_name, country_display_name),
+                ).fetchone()[0]
 
             # Check for duplicates
             existing = set()

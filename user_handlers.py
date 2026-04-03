@@ -64,6 +64,23 @@ def register_handlers(bot, get_db_connection, logger):
         finally:
             active_assignment_messages.pop(user_id, None)
 
+    def safe_delete_message(chat_id, message_id):
+        if not message_id:
+            return False
+        try:
+            bot.delete_message(chat_id, message_id)
+            return True
+        except Exception:
+            return False
+
+    def is_non_editable_message_error(err):
+        text = str(err or "").lower()
+        return (
+            "message can't be edited" in text
+            or "message cant be edited" in text
+            or "message to edit not found" in text
+        )
+
     def format_user_identity(user_id, username=None, first_name=None, last_name=None):
         u = username
         fn = first_name
@@ -511,7 +528,6 @@ def register_handlers(bot, get_db_connection, logger):
         markup.add(types.InlineKeyboardButton("⬅️ Back to Services", callback_data="get_number"))
         text, title_entities = build_select_country_title(service_name, "", "")
         from core import BOT_TOKEN
-        
         if edit_msg_id:
             ok, _err = styled_edit_message_with_markup(
                 BOT_TOKEN,
@@ -1236,7 +1252,6 @@ def register_handlers(bot, get_db_connection, logger):
                     
                     keyboard = build_main_keyboard()
                     user_search_cache[user_id] = prefix
-
                     styled_rows = styled_build_number_rows(button_flag, display_numbers, {}, custom_emoji_id=country_custom_emoji_id)
                     styled_rows.extend(
                         styled_build_action_rows(
@@ -1255,34 +1270,39 @@ def register_handlers(bot, get_db_connection, logger):
                             styled_rows,
                             entities=success_entities,
                         )
-                        if not styled_ok:
+                        if not styled_ok and not is_non_editable_message_error(styled_err):
                             logger.warning(f"Styled edit failed, fallback used: {styled_err}")
-                            try:
-                                bot.edit_message_text(
-                                    success_text,
-                                    chat_id,
-                                    edit_msg_id,
-                                    reply_markup=search_markup,
-                                    entities=success_entities,
-                                    parse_mode=None,
-                                )
-                                delete_previous_assignment_message(chat_id, user_id, keep_message_id=edit_msg_id)
-                                remember_assignment_message(user_id, edit_msg_id)
-                            except Exception as e:
-                                logger.error(f"Failed to edit message: {e}")
-                                delete_previous_assignment_message(chat_id, user_id)
-                                sent = bot.send_message(
-                                    chat_id,
-                                    success_text,
-                                    reply_markup=search_markup,
-                                    entities=success_entities,
-                                    parse_mode=None,
-                                )
-                                remember_assignment_message(user_id, sent.message_id)
-                                bot.send_message(chat_id, "", reply_markup=keyboard)
-                        else:
+                        if edit_msg_id and styled_ok:
                             delete_previous_assignment_message(chat_id, user_id, keep_message_id=edit_msg_id)
                             remember_assignment_message(user_id, edit_msg_id)
+                        else:
+                            safe_delete_message(chat_id, edit_msg_id)
+                            delete_previous_assignment_message(chat_id, user_id)
+                            styled_send_ok, styled_send_err, styled_message_id = styled_send_message(
+                                BOT_TOKEN,
+                                chat_id,
+                                success_text,
+                                styled_rows,
+                                entities=success_entities,
+                            )
+                            if not styled_send_ok:
+                                if not is_non_editable_message_error(styled_send_err):
+                                    logger.warning(f"Styled resend failed, fallback used: {styled_send_err}")
+                                try:
+                                    sent = bot.send_message(
+                                        chat_id,
+                                        success_text,
+                                        reply_markup=search_markup,
+                                        entities=success_entities,
+                                        parse_mode=None,
+                                    )
+                                    remember_assignment_message(user_id, sent.message_id)
+                                except Exception as send_err:
+                                    logger.error(f"Failed to send search results: {send_err}")
+                                    raise
+                            else:
+                                remember_assignment_message(user_id, styled_message_id)
+                            bot.send_message(chat_id, "•", reply_markup=keyboard)
                     else:
                         styled_ok, styled_err, styled_message_id = styled_send_message(
                             BOT_TOKEN,
@@ -1292,20 +1312,21 @@ def register_handlers(bot, get_db_connection, logger):
                             entities=success_entities,
                         )
                         if not styled_ok:
-                            logger.warning(f"Styled send failed, fallback used: {styled_err}")
+                            if not is_non_editable_message_error(styled_err):
+                                logger.warning(f"Styled send failed, fallback used: {styled_err}")
                             delete_previous_assignment_message(chat_id, user_id)
                             sent = bot.send_message(
-                                chat_id,
-                                success_text,
-                                reply_markup=search_markup,
-                                entities=success_entities,
-                                parse_mode=None,
+                                    chat_id,
+                                    success_text,
+                                    reply_markup=search_markup,
+                                    entities=success_entities,
+                                    parse_mode=None,
                             )
                             remember_assignment_message(user_id, sent.message_id)
                         else:
                             delete_previous_assignment_message(chat_id, user_id, keep_message_id=styled_message_id)
                             remember_assignment_message(user_id, styled_message_id)
-                        bot.send_message(chat_id, "", reply_markup=keyboard)
+                        bot.send_message(chat_id, "•", reply_markup=keyboard)
         
         except Exception as e:
             logger.error(f"Error searching numbers: {e}")
