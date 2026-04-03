@@ -788,10 +788,6 @@ def _init_sqlite_db(conn):
         c.execute("ALTER TABLE services ADD COLUMN country_code TEXT DEFAULT ''")
     if "country_display_name" not in existing_service_cols:
         c.execute("ALTER TABLE services ADD COLUMN country_display_name TEXT DEFAULT ''")
-    _backfill_service_country_metadata(conn)
-    _dedupe_button_emoji_in_service_names(conn)
-    _cleanup_broken_custom_emoji_tokens(conn)
-    _merge_duplicate_services(conn)
 
     c.execute(
         """CREATE TABLE IF NOT EXISTS numbers (
@@ -890,6 +886,8 @@ def _init_sqlite_db(conn):
         c.execute("ALTER TABLE service_button_overrides ADD COLUMN button_emoji TEXT DEFAULT ''")
     if "custom_emoji_id" not in existing_button_cols:
         c.execute("ALTER TABLE service_button_overrides ADD COLUMN custom_emoji_id TEXT DEFAULT ''")
+    _backfill_service_country_metadata(conn)
+    _dedupe_button_emoji_in_service_names(conn)
     _cleanup_broken_custom_emoji_tokens(conn)
     _merge_duplicate_services(conn)
     c.execute("CREATE INDEX IF NOT EXISTS idx_service_id ON numbers(service_id)")
